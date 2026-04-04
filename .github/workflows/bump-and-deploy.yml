@@ -1,0 +1,11 @@
+name: Bump and Deploy
+on:
+  push:
+    branches:
+      - 'master'
+      - 'main'
+
+jobs:
+  release:
+    uses: gnome-trading-group/gnome-build-tools/.github/workflows/bump-and-deploy.yml@main
+    secrets: inherit
