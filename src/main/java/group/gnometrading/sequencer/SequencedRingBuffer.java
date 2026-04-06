@@ -2,12 +2,14 @@ package group.gnometrading.sequencer;
 
 import com.lmax.disruptor.EventFactory;
 import com.lmax.disruptor.EventHandler;
+import com.lmax.disruptor.EventPoller;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.YieldingWaitStrategy;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 import com.lmax.disruptor.util.DaemonThreadFactory;
-import group.gnometrading.schemas.Schema;
+import group.gnometrading.schemas.SbeMessage;
+import org.agrona.concurrent.UnsafeBuffer;
 
 /**
  * Wraps a LMAX Disruptor ring buffer with automatic global sequence assignment.
@@ -22,7 +24,7 @@ import group.gnometrading.schemas.Schema;
  *
  * @param <T> the schema type produced by this ring buffer
  */
-public final class SequencedRingBuffer<T extends Schema> {
+public final class SequencedRingBuffer<T extends SbeMessage> {
 
     public static final int DEFAULT_SIZE = 1 << 10;
 
@@ -94,6 +96,36 @@ public final class SequencedRingBuffer<T extends Schema> {
      */
     public void addHandler(EventHandler<SequencedEvent> handler) {
         this.disruptor.handleEventsWith(handler);
+    }
+
+    /**
+     * Creates a {@link SequencedPoller} for polling this ring buffer from a
+     * {@link group.gnometrading.concurrent.GnomeAgent} doWork() loop.
+     *
+     * <p>Must be called before {@link #start()}. The handler is stored at construction
+     * time for zero-allocation polling.
+     */
+    public SequencedPoller createPoller(SequencedEventHandler handler) {
+        EventPoller<SequencedEvent> poller = this.ringBuffer.newPoller();
+        this.ringBuffer.addGatingSequences(poller.getSequence());
+        return new SequencedPoller(poller, handler);
+    }
+
+    /**
+     * Publishes raw bytes from any SBE message into the ring buffer without using the
+     * typed flyweight returned by {@link #claim()}.
+     *
+     * <p>Used when the caller owns the SBE message object (e.g., the OMS agent writing
+     * Order/CancelOrder/ModifyOrder to the outbound ring buffer).
+     */
+    public void publishRaw(UnsafeBuffer src, int templateId, int length) {
+        long seq = this.ringBuffer.next();
+        SequencedEvent event = this.ringBuffer.get(seq);
+        event.globalSequence = this.globalSequence.next();
+        event.templateId = templateId;
+        event.bufferLength = length;
+        event.buffer.putBytes(0, src, 0, length);
+        this.ringBuffer.publish(seq);
     }
 
     /**
