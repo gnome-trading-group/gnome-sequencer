@@ -29,8 +29,7 @@ import org.agrona.concurrent.UnsafeBuffer;
  * <p>On each event, looks up the pre-allocated schema by templateId, wraps it around
  * the SequencedEvent's buffer memory (zero-copy), and delegates to the underlying handler.
  *
- * <p>Zero-copy: the schema's buffer is wrapped around the SequencedEvent's memory using
- * {@link UnsafeBuffer#wrap}, then encoder/decoder are re-wrapped via {@link Schema#wrap}.
+ * <p>Zero-copy: the schema is wrapped around the SequencedEvent's memory using {@link Schema#wrap}.
  * No bytes are copied. The schema reference is safe to use only within the handler callback.
  *
  * <p>Handles market data template IDs (1-9). Template IDs outside this range will throw.
@@ -69,10 +68,8 @@ public final class SchemaEventAdapter implements SequencedEventHandler {
         if (schema == null) {
             throw new IllegalArgumentException("No schema registered for templateId: " + templateId);
         }
-        // Zero-copy: wrap the schema's buffer around the SequencedEvent buffer memory,
-        // then re-wrap encoder/decoder so field reads return the correct values.
-        schema.buffer.wrap(buffer, 0, length);
-        schema.wrap(schema.buffer);
+        // Zero-copy: wrap the schema's around the SequencedEvent buffer memory
+        schema.wrap(buffer);
         delegate.onEvent(schema, globalSequence, false);
     }
 }
