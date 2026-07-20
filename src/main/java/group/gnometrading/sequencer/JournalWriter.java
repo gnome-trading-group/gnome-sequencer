@@ -8,6 +8,8 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
@@ -31,9 +33,10 @@ import org.agrona.concurrent.UnsafeBuffer;
  * File is flushed on close; no fsync per event.
  *
  * <p>Thread-safe: {@link #onEvent}, {@link #close}, and {@link #lastFlushedSequence} are
- * synchronized to allow a single instance to be attached to multiple ring buffers whose
- * Disruptor consumer threads call {@code onEvent} concurrently. {@link #flush} is intentionally
- * unsynchronized — {@link MappedByteBuffer#force} is safe to invoke concurrently with writes.
+ * guarded by a {@link ReentrantLock} to allow a single instance to be attached to multiple ring
+ * buffers whose Disruptor consumer threads call {@code onEvent} concurrently. {@link #flush} is
+ * intentionally lock-free — {@link MappedByteBuffer#force} is safe to invoke concurrently with
+ * writes.
  */
 public final class JournalWriter implements EventHandler<SequencedEvent>, Closeable {
 
@@ -49,6 +52,7 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
     private final UnsafeBuffer[] reorderPayloads;
 
     private final MappedByteBuffer mappedBuffer;
+    private final Lock lock = new ReentrantLock();
     private long lastFlushedSequence;
     private boolean closed;
 
@@ -79,16 +83,21 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
     }
 
     @Override
-    public synchronized void onEvent(SequencedEvent event, long sequence, boolean endOfBatch) {
-        if (closed) {
-            return;
+    public void onEvent(SequencedEvent event, long sequence, boolean endOfBatch) {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            int slot = (int) (event.globalSequence & REORDER_BUFFER_MASK);
+            reorderSequences[slot] = event.globalSequence;
+            reorderTemplateIds[slot] = event.templateId;
+            reorderLengths[slot] = event.bufferLength;
+            reorderPayloads[slot].putBytes(0, event.buffer, 0, event.bufferLength);
+            flushContiguous();
+        } finally {
+            lock.unlock();
         }
-        int slot = (int) (event.globalSequence & REORDER_BUFFER_MASK);
-        reorderSequences[slot] = event.globalSequence;
-        reorderTemplateIds[slot] = event.templateId;
-        reorderLengths[slot] = event.bufferLength;
-        reorderPayloads[slot].putBytes(0, event.buffer, 0, event.bufferLength);
-        flushContiguous();
     }
 
     private void flushContiguous() {
@@ -114,16 +123,26 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
      *
      * @return the last flushed sequence
      */
-    public synchronized long lastFlushedSequence() {
-        return lastFlushedSequence;
+    public long lastFlushedSequence() {
+        lock.lock();
+        try {
+            return lastFlushedSequence;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
      * Returns the number of bytes written to the journal file so far.
      * Safe to call after {@link #close()} to determine how many bytes to compress and upload.
      */
-    public synchronized int writtenBytes() {
-        return mappedBuffer.position();
+    public int writtenBytes() {
+        lock.lock();
+        try {
+            return mappedBuffer.position();
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
@@ -136,8 +155,13 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
     }
 
     @Override
-    public synchronized void close() {
-        closed = true;
+    public void close() {
+        lock.lock();
+        try {
+            closed = true;
+        } finally {
+            lock.unlock();
+        }
         mappedBuffer.force();
     }
 }

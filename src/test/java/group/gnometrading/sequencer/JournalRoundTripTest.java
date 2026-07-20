@@ -43,8 +43,8 @@ class JournalRoundTripTest {
         }
 
         assertTrue(latch.await(5, TimeUnit.SECONDS), "Timed out waiting for events");
-        writer.close();
         ringBuffer.shutdown();
+        writer.close();
 
         // Read back and verify
         AtomicInteger readCount = new AtomicInteger(0);
