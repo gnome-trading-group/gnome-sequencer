@@ -29,13 +29,18 @@ import org.agrona.concurrent.UnsafeBuffer;
  *
  * <p>All fields are pre-allocated at construction time. {@link #onEvent} is zero-allocation.
  * File is flushed on close; no fsync per event.
+ *
+ * <p>Thread-safe: {@link #onEvent}, {@link #close}, and {@link #lastFlushedSequence} are
+ * synchronized to allow a single instance to be attached to multiple ring buffers whose
+ * Disruptor consumer threads call {@code onEvent} concurrently. {@link #flush} is intentionally
+ * unsynchronized — {@link MappedByteBuffer#force} is safe to invoke concurrently with writes.
  */
 public final class JournalWriter implements EventHandler<SequencedEvent>, Closeable {
 
     static final int HEADER_SIZE = Long.BYTES + Short.BYTES + Short.BYTES;
 
     // Reorder buffer sized as a power-of-2 to allow bitwise-mask indexing.
-    private static final int REORDER_BUFFER_CAPACITY = 1 << 6;
+    private static final int REORDER_BUFFER_CAPACITY = 1 << 8;
     private static final int REORDER_BUFFER_MASK = REORDER_BUFFER_CAPACITY - 1;
 
     private final long[] reorderSequences;
@@ -45,6 +50,7 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
 
     private final MappedByteBuffer mappedBuffer;
     private long lastFlushedSequence;
+    private boolean closed;
 
     /**
      * Opens a new journal file at the given path.
@@ -62,6 +68,7 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
             this.reorderPayloads[i] = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
         }
         this.lastFlushedSequence = 0;
+        this.closed = false;
 
         try (FileChannel channel =
                 FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
@@ -72,7 +79,10 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
     }
 
     @Override
-    public void onEvent(SequencedEvent event, long sequence, boolean endOfBatch) {
+    public synchronized void onEvent(SequencedEvent event, long sequence, boolean endOfBatch) {
+        if (closed) {
+            return;
+        }
         int slot = (int) (event.globalSequence & REORDER_BUFFER_MASK);
         reorderSequences[slot] = event.globalSequence;
         reorderTemplateIds[slot] = event.templateId;
@@ -104,12 +114,30 @@ public final class JournalWriter implements EventHandler<SequencedEvent>, Closea
      *
      * @return the last flushed sequence
      */
-    public long lastFlushedSequence() {
+    public synchronized long lastFlushedSequence() {
         return lastFlushedSequence;
     }
 
+    /**
+     * Returns the number of bytes written to the journal file so far.
+     * Safe to call after {@link #close()} to determine how many bytes to compress and upload.
+     */
+    public synchronized int writtenBytes() {
+        return mappedBuffer.position();
+    }
+
+    /**
+     * Forces any dirty pages to disk without stopping event processing.
+     * Called periodically by an off-hot-path timer to protect against data loss on hard crash.
+     * Not synchronized — {@link MappedByteBuffer#force} is safe to call concurrently with writes.
+     */
+    public void flush() {
+        mappedBuffer.force();
+    }
+
     @Override
-    public void close() {
+    public synchronized void close() {
+        closed = true;
         mappedBuffer.force();
     }
 }
