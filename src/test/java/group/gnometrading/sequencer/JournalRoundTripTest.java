@@ -3,8 +3,10 @@ package group.gnometrading.sequencer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import group.gnometrading.schemas.IntentDecoder;
 import group.gnometrading.schemas.Mbp10Decoder;
 import group.gnometrading.schemas.Mbp10Schema;
+import group.gnometrading.schemas.MessageHeaderDecoder;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -109,6 +111,39 @@ class JournalRoundTripTest {
         assertEquals(2, callCount.get());
         assertEquals(1L, firstSeq.get());
         assertEquals(2L, secondSeq.get());
+    }
+
+    @Test
+    void recordsFromAnOlderSchemaVersionAreReplayedAtTheCurrentOne() throws IOException {
+        Path journalPath = tempDir.resolve("old-version.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+
+        // An Intent journaled by schema v0, with a size beyond the old uint32 signed range.
+        SequencedEvent oldIntent = new SequencedEvent();
+        oldIntent.globalSequence = 1;
+        oldIntent.templateId = IntentDecoder.TEMPLATE_ID;
+        new group.gnometrading.schemas.v0.IntentEncoder()
+                .wrapAndApplyHeader(oldIntent.buffer, 0, new group.gnometrading.schemas.v0.MessageHeaderEncoder())
+                .bidPrice(55L)
+                .bidSize(4_000_000_000L);
+        oldIntent.bufferLength =
+                MessageHeaderDecoder.ENCODED_LENGTH + group.gnometrading.schemas.v0.IntentEncoder.BLOCK_LENGTH;
+        writer.onEvent(oldIntent, 0, false);
+        writer.close();
+
+        AtomicLong bidSize = new AtomicLong();
+        AtomicInteger version = new AtomicInteger(-1);
+        JournalReader reader = new JournalReader(journalPath);
+        reader.readAll((gSeq, templateId, buffer, length) -> {
+            IntentDecoder decoder = new IntentDecoder().wrapAndApplyHeader(buffer, 0, new MessageHeaderDecoder());
+            version.set(decoder.sbeSchemaVersion());
+            bidSize.set(decoder.bidSize());
+            assertEquals(MessageHeaderDecoder.ENCODED_LENGTH + IntentDecoder.BLOCK_LENGTH, length);
+        });
+        reader.close();
+
+        assertEquals(IntentDecoder.SCHEMA_VERSION, version.get());
+        assertEquals(4_000_000_000L, bidSize.get());
     }
 
     @Test

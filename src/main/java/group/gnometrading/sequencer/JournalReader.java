@@ -1,5 +1,7 @@
 package group.gnometrading.sequencer;
 
+import group.gnometrading.schemas.MessageHeaderDecoder;
+import group.gnometrading.schemas.migration.SbeMigrator;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteOrder;
@@ -16,11 +18,18 @@ import org.agrona.concurrent.UnsafeBuffer;
  * <p>Reading is sequential and zero-allocation on the hot path. The payload buffer
  * passed to the callback is a pre-allocated flyweight that is reused across calls;
  * callers must not retain a reference beyond the callback.
+ *
+ * <p>Records written by an older schema version are migrated to the current one before the callback
+ * sees them, so a journal outlives schema changes. Only those records are copied.
  */
 public final class JournalReader implements Closeable {
 
+    private static final int UINT16_MASK = 0xFFFF;
+
     private final MappedByteBuffer mappedBuffer;
     private final UnsafeBuffer payloadFlyweight;
+    // A migrated message has the current layout, so it fits the largest current message.
+    private final UnsafeBuffer migratedPayload = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
     private long lastReadSequence;
 
     /**
@@ -71,8 +80,21 @@ public final class JournalReader implements Closeable {
             payloadFlyweight.wrap(payloadFlyweight.byteArray(), 0, length);
 
             lastReadSequence = globalSequence;
-            handler.onRecord(globalSequence, templateId, payloadFlyweight, length);
+            if (isOlderGnomeMessage(length)) {
+                final int migratedLength = SbeMigrator.migrateMessage(payloadFlyweight, 0, migratedPayload, 0);
+                handler.onRecord(globalSequence, templateId, migratedPayload, migratedLength);
+            } else {
+                handler.onRecord(globalSequence, templateId, payloadFlyweight, length);
+            }
         }
+    }
+
+    private boolean isOlderGnomeMessage(final int length) {
+        return length >= MessageHeaderDecoder.ENCODED_LENGTH
+                && (payloadFlyweight.getShort(MessageHeaderDecoder.schemaIdEncodingOffset(), ByteOrder.LITTLE_ENDIAN)
+                                & UINT16_MASK)
+                        == MessageHeaderDecoder.SCHEMA_ID
+                && SbeMigrator.needsMigration(payloadFlyweight, 0);
     }
 
     /**
