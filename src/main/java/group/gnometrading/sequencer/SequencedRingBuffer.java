@@ -1,26 +1,28 @@
 package group.gnometrading.sequencer;
 
 import com.lmax.disruptor.EventFactory;
-import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.EventPoller;
 import com.lmax.disruptor.RingBuffer;
-import com.lmax.disruptor.YieldingWaitStrategy;
-import com.lmax.disruptor.dsl.Disruptor;
-import com.lmax.disruptor.dsl.ProducerType;
-import com.lmax.disruptor.util.DaemonThreadFactory;
+import com.lmax.disruptor.SleepingWaitStrategy;
 import group.gnometrading.schemas.SbeMessage;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
- * Wraps a LMAX Disruptor ring buffer with automatic global sequence assignment.
+ * Wraps a LMAX Disruptor {@link RingBuffer} with automatic global sequence assignment.
  *
  * <p>Producers call {@link #claim()} to get the pre-allocated schema flyweight,
  * write into it using the typed SBE encoder, then call {@link #publish()} to assign
  * a global sequence number and make the event visible to consumers.
  *
  * <p>All operations are zero-allocation. The schema flyweight is pre-allocated and
- * reused on every claim/publish cycle. Safe because each ring buffer uses
- * {@link ProducerType#SINGLE} — only one claim may be outstanding at a time.
+ * reused on every claim/publish cycle. Safe because each ring buffer has a single
+ * producer — only one claim may be outstanding at a time.
+ *
+ * <p>Consumers only read through {@link #createPoller}, from a
+ * {@link group.gnometrading.concurrent.GnomeAgent} whose idle policy decides how it waits.
+ * There are no buffer-owned consumer threads: a Disruptor-managed thread spins or yields under
+ * its wait strategy forever, which pins a core per buffer and gets CPU-quota containers
+ * throttled.
  *
  * @param <T> the schema type produced by this ring buffer
  */
@@ -28,7 +30,6 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
 
     public static final int DEFAULT_SIZE = 1 << 10;
 
-    private final Disruptor<SequencedEvent> disruptor;
     private final RingBuffer<SequencedEvent> ringBuffer;
     private final GlobalSequence globalSequence;
 
@@ -46,13 +47,10 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     public SequencedRingBuffer(EventFactory<T> schemaFactory, GlobalSequence globalSequence, int size) {
         this.globalSequence = globalSequence;
         this.schema = schemaFactory.newInstance();
-        this.disruptor = new Disruptor<>(
-                SequencedEvent.FACTORY,
-                size,
-                DaemonThreadFactory.INSTANCE,
-                ProducerType.SINGLE,
-                new YieldingWaitStrategy());
-        this.ringBuffer = this.disruptor.getRingBuffer();
+        // Pollers never wait on the strategy. Sleeping's signalAllWhenBlocking is a no-op, so publish()
+        // pays nothing for it, unlike BlockingWaitStrategy's lock + notifyAll.
+        this.ringBuffer = RingBuffer.createSingleProducer(SequencedEvent.FACTORY, size, new SleepingWaitStrategy());
+        globalSequence.register(this);
     }
 
     /**
@@ -82,28 +80,12 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     }
 
     /**
-     * Registers typed event handlers as consumers on this ring buffer.
-     */
-    public void handleEventsWith(SequencedEventHandler... handlers) {
-        this.disruptor.handleEventsWith(handlers);
-    }
-
-    /**
-     * Registers a raw {@link EventHandler} (e.g., {@link JournalWriter}) as a consumer.
-     *
-     * <p>Use this overload for handlers that operate directly on {@link SequencedEvent}
-     * without the typed unwrapping provided by {@link SequencedEventHandler}.
-     */
-    public void addHandler(EventHandler<SequencedEvent> handler) {
-        this.disruptor.handleEventsWith(handler);
-    }
-
-    /**
      * Creates a {@link SequencedPoller} for polling this ring buffer from a
      * {@link group.gnometrading.concurrent.GnomeAgent} doWork() loop.
      *
-     * <p>Must be called before {@link #start()}. The handler is stored at construction
-     * time for zero-allocation polling.
+     * <p>Must be called before the producer first publishes: the poller only sees events published
+     * after it is created, and only gates the producer from then on. The handler is stored at
+     * construction time for zero-allocation polling.
      */
     public SequencedPoller createPoller(SequencedEventHandler handler) {
         EventPoller<SequencedEvent> poller = this.ringBuffer.newPoller();
@@ -126,19 +108,5 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
         event.bufferLength = length;
         event.buffer.putBytes(0, src, 0, length);
         this.ringBuffer.publish(seq);
-    }
-
-    /**
-     * Starts the Disruptor. Must be called after all handlers are registered.
-     */
-    public void start() {
-        this.disruptor.start();
-    }
-
-    /**
-     * Shuts down the Disruptor.
-     */
-    public void shutdown() {
-        this.disruptor.shutdown();
     }
 }

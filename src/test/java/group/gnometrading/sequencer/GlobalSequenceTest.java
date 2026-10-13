@@ -1,8 +1,12 @@
 package group.gnometrading.sequencer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import group.gnometrading.schemas.Intent;
+import group.gnometrading.schemas.Mbp10Schema;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class GlobalSequenceTest {
@@ -50,5 +54,18 @@ class GlobalSequenceTest {
         for (int i = 1; i <= threadCount * incrementsPerThread; i++) {
             assertTrue(seen[i], "Missing sequence number: " + i);
         }
+    }
+
+    @Test
+    void registersEveryBufferConstructedOnIt() {
+        GlobalSequence shared = new GlobalSequence();
+        GlobalSequence other = new GlobalSequence();
+        SequencedRingBuffer<Mbp10Schema> first = new SequencedRingBuffer<>(Mbp10Schema::new, shared);
+        SequencedRingBuffer<Intent> second = new SequencedRingBuffer<>(Intent::new, shared);
+        SequencedRingBuffer<Intent> elsewhere = new SequencedRingBuffer<>(Intent::new, other);
+
+        assertEquals(List.of(first, second), shared.buffers());
+        assertEquals(List.of(elsewhere), other.buffers());
+        assertThrows(UnsupportedOperationException.class, () -> shared.buffers().clear());
     }
 }

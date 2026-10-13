@@ -64,6 +64,7 @@ public final class JournalReader implements Closeable {
                 break;
             }
 
+            int sourceId = Short.toUnsignedInt(mappedBuffer.getShort());
             int templateId = Short.toUnsignedInt(mappedBuffer.getShort());
             int length = Short.toUnsignedInt(mappedBuffer.getShort());
 
@@ -82,9 +83,9 @@ public final class JournalReader implements Closeable {
             lastReadSequence = globalSequence;
             if (isOlderGnomeMessage(length)) {
                 final int migratedLength = SbeMigrator.migrateMessage(payloadFlyweight, 0, migratedPayload, 0);
-                handler.onRecord(globalSequence, templateId, migratedPayload, migratedLength);
+                handler.onRecord(globalSequence, sourceId, templateId, migratedPayload, migratedLength);
             } else {
-                handler.onRecord(globalSequence, templateId, payloadFlyweight, length);
+                handler.onRecord(globalSequence, sourceId, templateId, payloadFlyweight, length);
             }
         }
     }

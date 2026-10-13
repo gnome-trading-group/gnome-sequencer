@@ -15,9 +15,10 @@ public interface JournalRecordHandler {
      * Called once per journal record in global sequence order.
      *
      * @param globalSequence the monotonically increasing global sequence number
+     * @param sourceId the id of the buffer the event was journaled from
      * @param templateId the SBE template ID identifying the message type
      * @param buffer the SBE payload bytes (flyweight, do not retain)
      * @param length the number of valid bytes in {@code buffer}
      */
-    void onRecord(long globalSequence, int templateId, UnsafeBuffer buffer, int length);
+    void onRecord(long globalSequence, int sourceId, int templateId, UnsafeBuffer buffer, int length);
 }
