@@ -5,6 +5,7 @@ import com.lmax.disruptor.EventPoller;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.SleepingWaitStrategy;
 import group.gnometrading.schemas.SbeMessage;
+import java.util.concurrent.locks.LockSupport;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
@@ -40,6 +41,8 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     private SequencedEvent claimedEvent;
     private long claimedDisruptorSequence;
 
+    private volatile boolean stopped;
+
     public SequencedRingBuffer(EventFactory<T> schemaFactory, GlobalSequence globalSequence) {
         this(schemaFactory, globalSequence, DEFAULT_SIZE);
     }
@@ -57,10 +60,12 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * Claims the next slot in the ring buffer and returns the pre-allocated schema flyweight.
      *
      * <p>The caller writes event data into the returned schema using its SBE encoder.
-     * Must be followed by a call to {@link #publish()}.
+     * Must be followed by a call to {@link #publish()}. Waits while the ring is full.
+     *
+     * @throws RingBufferStoppedException if the ring is stopped, or the thread interrupted, while waiting for room
      */
     public T claim() {
-        this.claimedDisruptorSequence = ringBuffer.next();
+        this.claimedDisruptorSequence = nextSequence();
         this.claimedEvent = ringBuffer.get(this.claimedDisruptorSequence);
         return this.schema;
     }
@@ -98,15 +103,41 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * typed flyweight returned by {@link #claim()}.
      *
      * <p>Used when the caller owns the SBE message object (e.g., the OMS agent writing
-     * Order/CancelOrder/ModifyOrder to the outbound ring buffer).
+     * Order/CancelOrder/ModifyOrder to the outbound ring buffer). Waits while the ring is full.
+     *
+     * @throws RingBufferStoppedException if the ring is stopped, or the thread interrupted, while waiting for room
      */
     public void publishRaw(UnsafeBuffer src, int templateId, int length) {
-        long seq = this.ringBuffer.next();
+        long seq = nextSequence();
         SequencedEvent event = this.ringBuffer.get(seq);
         event.globalSequence = this.globalSequence.next();
         event.templateId = templateId;
         event.bufferLength = length;
         event.buffer.putBytes(0, src, 0, length);
         this.ringBuffer.publish(seq);
+    }
+
+    /**
+     * Releases a producer waiting for room, for good: a wait that would otherwise last forever, on a consumer that has
+     * stopped, ends in {@link RingBufferStoppedException}. A claim that finds room is unaffected. For the producer's
+     * own shutdown; the ring isn't used after.
+     */
+    public void stop() {
+        this.stopped = true;
+    }
+
+    /**
+     * The next slot, waiting while the slowest poller is a whole ring behind. Disruptor's own wait can't be ended: it
+     * parks in a loop that ignores both interrupts and shutdown, so a producer on a consumer that stopped would hang.
+     */
+    private long nextSequence() {
+        while (!this.ringBuffer.hasAvailableCapacity(1)) {
+            if (this.stopped || Thread.currentThread().isInterrupted()) {
+                throw RingBufferStoppedException.INSTANCE;
+            }
+            LockSupport.parkNanos(1L);
+        }
+        // Single producer: with room seen, next() returns without waiting.
+        return this.ringBuffer.next();
     }
 }
