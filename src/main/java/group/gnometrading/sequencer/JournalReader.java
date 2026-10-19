@@ -12,7 +12,7 @@ import java.nio.file.StandardOpenOption;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
- * Reads a journal file written by {@link JournalWriter} and replays records
+ * Reads one journal segment written by {@link JournalWriter} and replays its records
  * in global sequence order via a callback.
  *
  * <p>Reading is sequential and zero-allocation on the hot path. The payload buffer
@@ -33,14 +33,25 @@ public final class JournalReader implements Closeable {
     private long lastReadSequence;
 
     /**
-     * Opens the journal file at the given path for reading.
+     * Opens the first segment of a journal for reading.
      *
-     * @param path the journal file path to read
+     * @param path the segment file to read
      * @throws IOException if the file cannot be opened or mapped
      */
     public JournalReader(Path path) throws IOException {
+        this(path, 0);
+    }
+
+    /**
+     * Opens a later segment of a journal for reading, so its first record must follow the previous segment's last.
+     *
+     * @param path the segment file to read
+     * @param previousSequence the last global sequence of the segment before it
+     * @throws IOException if the file cannot be opened or mapped
+     */
+    public JournalReader(Path path, long previousSequence) throws IOException {
         this.payloadFlyweight = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
-        this.lastReadSequence = 0;
+        this.lastReadSequence = previousSequence;
 
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             this.mappedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());

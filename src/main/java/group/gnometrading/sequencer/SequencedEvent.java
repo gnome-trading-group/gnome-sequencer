@@ -8,8 +8,9 @@ import org.agrona.concurrent.UnsafeBuffer;
 
 public final class SequencedEvent {
 
-    // Sized to fit the largest SBE message (Mbp10: 374 block + 8 header).
-    static final int MAX_MESSAGE_SIZE = MessageHeaderEncoder.ENCODED_LENGTH + Mbp10Encoder.BLOCK_LENGTH;
+    // Sized to fit the largest SBE message (Mbp10: 374 block + 8 header). Metric rows are capped to fit it rather
+    // than growing it; SchemaSlotSizeTest holds both.
+    public static final int MAX_MESSAGE_SIZE = MessageHeaderEncoder.ENCODED_LENGTH + Mbp10Encoder.BLOCK_LENGTH;
 
     public static final EventFactory<SequencedEvent> FACTORY = SequencedEvent::new;
 

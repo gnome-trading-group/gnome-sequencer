@@ -1,6 +1,7 @@
 package group.gnometrading.sequencer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,10 +29,16 @@ class JournalRoundTripTest {
     @TempDir
     Path tempDir;
 
+    private final List<JournalSegment> segments = new ArrayList<>();
+
+    private static Path firstSegment(Path journal) {
+        return journal.resolve(JournalWriter.segmentFileName(0));
+    }
+
     @Test
     void writeThenReadProducesSameEventsInOrder() throws Exception {
         Path journalPath = tempDir.resolve("test.journal");
-        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
 
         GlobalSequence globalSequence = new GlobalSequence();
         SequencedRingBuffer<Mbp10Schema> ringBuffer = new SequencedRingBuffer<>(Mbp10Schema::new, globalSequence);
@@ -48,7 +55,7 @@ class JournalRoundTripTest {
         AtomicInteger readCount = new AtomicInteger(0);
         AtomicLong lastSeq = new AtomicLong(0);
 
-        JournalReader reader = new JournalReader(journalPath);
+        JournalReader reader = new JournalReader(firstSegment(journalPath));
         reader.readAll((gSeq, sourceId, templateId, buffer, length) -> {
             readCount.incrementAndGet();
             lastSeq.set(gSeq);
@@ -65,7 +72,7 @@ class JournalRoundTripTest {
     @Test
     void buffersSharingASequenceAreJournaledInGlobalOrderWithTheirSource() throws Exception {
         Path journalPath = tempDir.resolve("interleaved.journal");
-        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
 
         GlobalSequence globalSequence = new GlobalSequence();
         SequencedRingBuffer<Mbp10Schema> marketData = new SequencedRingBuffer<>(Mbp10Schema::new, globalSequence);
@@ -92,7 +99,7 @@ class JournalRoundTripTest {
         List<Long> sequences = new ArrayList<>();
         List<Integer> sources = new ArrayList<>();
         List<Integer> templates = new ArrayList<>();
-        JournalReader reader = new JournalReader(journalPath);
+        JournalReader reader = new JournalReader(firstSegment(journalPath));
         reader.readAll((gSeq, sourceId, templateId, buffer, length) -> {
             sequences.add(gSeq);
             sources.add(sourceId);
@@ -114,7 +121,7 @@ class JournalRoundTripTest {
     @Test
     void reorderBufferHandlesOutOfOrderArrival() throws IOException {
         Path journalPath = tempDir.resolve("reorder.journal");
-        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
 
         writer.append(0, 2, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
         assertEquals(0, writer.lastFlushedSequence(), "Should not flush seq=2 before seq=1");
@@ -125,7 +132,7 @@ class JournalRoundTripTest {
         writer.close();
 
         List<Long> sequences = new ArrayList<>();
-        JournalReader reader = new JournalReader(journalPath);
+        JournalReader reader = new JournalReader(firstSegment(journalPath));
         reader.readAll((gSeq, sourceId, templateId, buffer, length) -> sequences.add(gSeq));
         reader.close();
 
@@ -134,7 +141,7 @@ class JournalRoundTripTest {
 
     @Test
     void unjournaledBufferOnTheSequenceFailsLoudlyInsteadOfStalling() throws Exception {
-        JournalWriter writer = new JournalWriter(tempDir.resolve("gap.journal"), FILE_SIZE);
+        JournalWriter writer = new JournalWriter(tempDir.resolve("gap.journal"), FILE_SIZE, segments::add);
 
         GlobalSequence globalSequence = new GlobalSequence();
         SequencedRingBuffer<Intent> journaled = new SequencedRingBuffer<>(Intent::new, globalSequence);
@@ -162,7 +169,7 @@ class JournalRoundTripTest {
 
     @Test
     void appendingAnAlreadyJournaledSequenceThrows() throws IOException {
-        JournalWriter writer = new JournalWriter(tempDir.resolve("duplicate.journal"), FILE_SIZE);
+        JournalWriter writer = new JournalWriter(tempDir.resolve("duplicate.journal"), FILE_SIZE, segments::add);
         writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
 
         assertThrows(IllegalStateException.class, () -> writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0));
@@ -172,7 +179,7 @@ class JournalRoundTripTest {
     @Test
     void recordsFromAnOlderSchemaVersionAreReplayedAtTheCurrentOne() throws IOException {
         Path journalPath = tempDir.resolve("old-version.journal");
-        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
 
         // An Intent journaled by schema v0, with a size beyond the old uint32 signed range.
         UnsafeBuffer oldIntent = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
@@ -187,7 +194,7 @@ class JournalRoundTripTest {
 
         AtomicLong bidSize = new AtomicLong();
         AtomicInteger version = new AtomicInteger(-1);
-        JournalReader reader = new JournalReader(journalPath);
+        JournalReader reader = new JournalReader(firstSegment(journalPath));
         reader.readAll((gSeq, sourceId, templateId, buffer, length) -> {
             IntentDecoder decoder = new IntentDecoder().wrapAndApplyHeader(buffer, 0, new MessageHeaderDecoder());
             version.set(decoder.sbeSchemaVersion());
@@ -201,10 +208,160 @@ class JournalRoundTripTest {
     }
 
     @Test
-    void journalFileExistsAfterWrite() throws IOException {
-        Path journalPath = tempDir.resolve("exists.journal");
-        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE);
+    void closingHandsOnTheLastSegment() throws IOException {
+        Path journalPath = tempDir.resolve("closed.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.append(0, 2, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
         writer.close();
-        assertTrue(Files.exists(journalPath));
+
+        assertEquals(1, segments.size());
+        JournalSegment segment = segments.get(0);
+        assertEquals(0, segment.index());
+        assertEquals(firstSegment(journalPath), segment.path());
+        assertEquals(2 * JournalWriter.HEADER_SIZE, segment.writtenBytes());
+        assertEquals(1, segment.firstSequence());
+        assertEquals(2, segment.lastSequence());
+    }
+
+    @Test
+    void sealingTrimsTheSegmentToItsRecordsAndMarksItDone() throws IOException {
+        Path journalPath = tempDir.resolve("sealed.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.append(0, 2, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.close();
+
+        JournalSegment segment = segments.get(0);
+        segment.seal();
+
+        assertEquals(journalPath.resolve(JournalWriter.sealedFileName(0)), segment.path());
+        assertFalse(Files.exists(firstSegment(journalPath)));
+        assertEquals(2L * JournalWriter.HEADER_SIZE, Files.size(segment.path()));
+        List<Long> sequences = new ArrayList<>();
+        JournalReader reader = new JournalReader(segment.path());
+        reader.readAll((gSeq, sourceId, templateId, buffer, length) -> sequences.add(gSeq));
+        reader.close();
+        assertEquals(List.of(1L, 2L), sequences);
+    }
+
+    @Test
+    void anEmptyJournalLeavesNoSegment() throws IOException {
+        Path journalPath = tempDir.resolve("empty.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
+        writer.close();
+
+        assertTrue(segments.isEmpty());
+        assertFalse(Files.exists(firstSegment(journalPath)));
+    }
+
+    @Test
+    void rollStartsTheNextSegmentAndReadingCarriesOnAcrossIt() throws IOException {
+        Path journalPath = tempDir.resolve("rolled.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.append(0, 2, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.roll();
+        writer.append(0, 3, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.close();
+
+        assertEquals(2, segments.size());
+        assertEquals(
+                List.of(1L, 3L),
+                List.of(segments.get(0).firstSequence(), segments.get(1).firstSequence()));
+        assertEquals(
+                journalPath.resolve(JournalWriter.segmentFileName(1)),
+                segments.get(1).path());
+
+        List<Long> sequences = new ArrayList<>();
+        long previous = 0;
+        for (JournalSegment segment : segments) {
+            segment.seal();
+            JournalReader reader = new JournalReader(segment.path(), previous);
+            reader.readAll((gSeq, sourceId, templateId, buffer, length) -> sequences.add(gSeq));
+            previous = reader.lastReadSequence();
+            reader.close();
+        }
+        assertEquals(List.of(1L, 2L, 3L), sequences);
+    }
+
+    @Test
+    void rollingAnEmptySegmentDoesNothing() throws IOException {
+        JournalWriter writer = new JournalWriter(tempDir.resolve("idle.journal"), FILE_SIZE, segments::add);
+        writer.roll();
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.roll();
+        writer.roll();
+
+        assertEquals(1, segments.size());
+        assertEquals(0, writer.segmentWrittenBytes());
+        writer.close();
+        assertEquals(1, segments.size());
+    }
+
+    @Test
+    void aRecordThatDoesNotFitStartsTheNextSegmentWhole() throws IOException {
+        int recordBytes = JournalWriter.HEADER_SIZE + SequencedEvent.MAX_MESSAGE_SIZE;
+        long segmentSize = recordBytes * 2L + recordBytes / 2;
+        UnsafeBuffer payload = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
+        payload.setMemory(0, SequencedEvent.MAX_MESSAGE_SIZE, (byte) 7);
+        Path journalPath = tempDir.resolve("full.journal");
+        JournalWriter writer = new JournalWriter(journalPath, segmentSize, segments::add);
+        for (int seq = 1; seq <= 5; seq++) {
+            writer.append(0, seq, Mbp10Decoder.TEMPLATE_ID, payload, SequencedEvent.MAX_MESSAGE_SIZE);
+        }
+        writer.close();
+
+        assertEquals(3, segments.size());
+        assertEquals(
+                List.of(2 * recordBytes, 2 * recordBytes, recordBytes),
+                segments.stream().map(JournalSegment::writtenBytes).toList());
+
+        List<Long> sequences = new ArrayList<>();
+        long previous = 0;
+        for (JournalSegment segment : segments) {
+            segment.seal();
+            JournalReader reader = new JournalReader(segment.path(), previous);
+            reader.readAll((gSeq, sourceId, templateId, buffer, length) -> {
+                sequences.add(gSeq);
+                assertEquals(SequencedEvent.MAX_MESSAGE_SIZE, length);
+                assertEquals(7, buffer.getByte(length - 1));
+            });
+            previous = reader.lastReadSequence();
+            reader.close();
+        }
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), sequences);
+    }
+
+    @Test
+    void aSegmentNotFollowingTheOneBeforeIsAGap() throws IOException {
+        Path journalPath = tempDir.resolve("gapped.journal");
+        JournalWriter writer = new JournalWriter(journalPath, FILE_SIZE, segments::add);
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.roll();
+        writer.append(0, 2, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.close();
+        segments.forEach(JournalSegment::seal);
+
+        JournalReader reader = new JournalReader(segments.get(1).path(), 0);
+        assertThrows(IllegalStateException.class, () -> reader.readAll((gSeq, sourceId, templateId, b, l) -> {}));
+    }
+
+    @Test
+    void aSegmentTooSmallForTheLargestRecordIsRefused() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new JournalWriter(
+                        tempDir.resolve("tiny.journal"), SequencedEvent.MAX_MESSAGE_SIZE, segments::add));
+    }
+
+    @Test
+    void sealingASegmentTwiceDoesNothing() throws IOException {
+        JournalWriter writer = new JournalWriter(tempDir.resolve("twice.journal"), FILE_SIZE, segments::add);
+        writer.append(0, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.close();
+        segments.get(0).seal();
+        segments.get(0).seal();
+        assertEquals(JournalWriter.HEADER_SIZE, Files.size(segments.get(0).path()));
     }
 }

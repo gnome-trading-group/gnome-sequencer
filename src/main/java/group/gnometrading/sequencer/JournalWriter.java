@@ -2,16 +2,20 @@ package group.gnometrading.sequencer;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.function.Consumer;
+import org.agrona.IoUtil;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
  * Persists sequenced events from one or more {@link SequencedRingBuffer} instances to a
- * memory-mapped journal file.
+ * journal: a directory of memory-mapped segment files, {@code segment-00000.bin} onwards.
  *
  * <p>Since producers independently grab global sequence numbers before publishing to their
  * respective ring buffers, events may arrive at this writer out of global sequence order.
@@ -31,11 +35,16 @@ import org.agrona.concurrent.UnsafeBuffer;
  * journal. Several buffers carry copies of the same message (an order and its routed copy),
  * and replay needs to tell them apart.
  *
- * <p>All fields are pre-allocated at construction time. {@link #append} is zero-allocation.
- * File is flushed on close; no fsync per event.
+ * <p>A segment ends when the next record doesn't fit or when {@link #roll()} is called, and is handed to the
+ * segment listener to {@link JournalSegment#seal seal}, so another process can ship the journal while the session
+ * runs. A record never spans two segments, and a segment with no records is never handed on.
  *
- * <p>Not thread-safe: one agent polls every journaled buffer and calls {@link #append},
- * {@link #flush} and {@link #close}.
+ * <p>All fields are pre-allocated at construction time. {@link #append} is zero-allocation except when it starts
+ * a new segment. Nothing is forced to disk: the mapped pages outlive the process in the page cache, so a crash loses
+ * no records, and the open segment can be shipped as it is.
+ *
+ * <p>Not thread-safe: one agent polls every journaled buffer and calls {@link #append}, {@link #roll} and
+ * {@link #close}.
  */
 public final class JournalWriter implements Closeable {
 
@@ -51,18 +60,31 @@ public final class JournalWriter implements Closeable {
     private final int[] reorderLengths;
     private final UnsafeBuffer[] reorderPayloads;
 
-    private final MappedByteBuffer mappedBuffer;
+    private final Path directory;
+    private final long segmentSizeBytes;
+    private final Consumer<JournalSegment> segmentListener;
+
+    private MappedByteBuffer mappedBuffer;
+    private Path segmentPath;
+    private int segmentIndex;
+    private long segmentFirstSequence;
     private long lastFlushedSequence;
     private boolean closed;
 
     /**
-     * Opens a new journal file at the given path.
+     * Opens a journal in {@code directory}, starting with its first segment.
      *
-     * @param path the journal file path to create or overwrite
-     * @param fileSizeBytes the size of the memory-mapped region in bytes
-     * @throws IOException if the file cannot be opened or mapped
+     * @param directory where the segment files go; created if missing
+     * @param segmentSizeBytes the size of each memory-mapped segment in bytes
+     * @param segmentListener called on the writing thread with each finished segment; must hand it off quickly
+     * @throws IOException if the directory or first segment cannot be created
      */
-    public JournalWriter(Path path, long fileSizeBytes) throws IOException {
+    public JournalWriter(Path directory, long segmentSizeBytes, Consumer<JournalSegment> segmentListener)
+            throws IOException {
+        if (segmentSizeBytes < HEADER_SIZE + SequencedEvent.MAX_MESSAGE_SIZE || segmentSizeBytes > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    "A segment must hold the largest record and fit one mapping: " + segmentSizeBytes + " bytes");
+        }
         this.reorderSequences = new long[REORDER_BUFFER_CAPACITY];
         this.reorderSourceIds = new int[REORDER_BUFFER_CAPACITY];
         this.reorderTemplateIds = new int[REORDER_BUFFER_CAPACITY];
@@ -71,15 +93,23 @@ public final class JournalWriter implements Closeable {
         for (int i = 0; i < REORDER_BUFFER_CAPACITY; i++) {
             this.reorderPayloads[i] = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
         }
+        this.directory = directory;
+        this.segmentSizeBytes = segmentSizeBytes;
+        this.segmentListener = segmentListener;
         this.lastFlushedSequence = 0;
         this.closed = false;
+        Files.createDirectories(directory);
+        openSegment(0);
+    }
 
-        try (FileChannel channel =
-                FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-            channel.truncate(fileSizeBytes);
-            this.mappedBuffer = channel.map(FileChannel.MapMode.READ_WRITE, 0, fileSizeBytes);
-            this.mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
-        }
+    /** The file name of segment {@code index} while it is written, so readers can find segments in order. */
+    public static String segmentFileName(int index) {
+        return String.format("segment-%05d.bin", index);
+    }
+
+    /** The file name of segment {@code index} once {@link JournalSegment#seal sealed}. */
+    public static String sealedFileName(int index) {
+        return String.format("segment-%05d.done", index);
     }
 
     /**
@@ -130,15 +160,66 @@ public final class JournalWriter implements Closeable {
                 break;
             }
             int length = reorderLengths[slot];
-            mappedBuffer.putLong(nextSeq);
-            mappedBuffer.putShort((short) reorderSourceIds[slot]);
-            mappedBuffer.putShort((short) reorderTemplateIds[slot]);
-            mappedBuffer.putShort((short) length);
+            MappedByteBuffer mapped = mappedBuffer;
+            if (mapped.remaining() < HEADER_SIZE + length) {
+                roll();
+                mapped = mappedBuffer;
+            }
+            if (mapped.position() == 0) {
+                segmentFirstSequence = nextSeq;
+            }
+            mapped.putLong(nextSeq);
+            mapped.putShort((short) reorderSourceIds[slot]);
+            mapped.putShort((short) reorderTemplateIds[slot]);
+            mapped.putShort((short) length);
             for (int i = 0; i < length; i++) {
-                mappedBuffer.put(reorderPayloads[slot].getByte(i));
+                mapped.put(reorderPayloads[slot].getByte(i));
             }
             lastFlushedSequence = nextSeq;
         }
+    }
+
+    /**
+     * Ends the open segment and starts the next one, handing the finished one to the segment listener. Does nothing
+     * while the open segment has no records.
+     *
+     * @throws UncheckedIOException if the next segment cannot be created
+     */
+    public void roll() {
+        if (closed || mappedBuffer.position() == 0) {
+            return;
+        }
+        JournalSegment finished = finishSegment();
+        try {
+            openSegment(segmentIndex + 1);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to start journal segment " + (segmentIndex + 1), e);
+        }
+        segmentListener.accept(finished);
+    }
+
+    private JournalSegment finishSegment() {
+        return new JournalSegment(
+                segmentIndex,
+                segmentPath,
+                mappedBuffer.position(),
+                segmentFirstSequence,
+                lastFlushedSequence,
+                mappedBuffer);
+    }
+
+    private void openSegment(int index) throws IOException {
+        Path path = directory.resolve(segmentFileName(index));
+        try (FileChannel channel =
+                FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            channel.truncate(0);
+            channel.truncate(segmentSizeBytes);
+            MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_WRITE, 0, segmentSizeBytes);
+            mapped.order(ByteOrder.LITTLE_ENDIAN);
+            this.mappedBuffer = mapped;
+        }
+        this.segmentPath = path;
+        this.segmentIndex = index;
     }
 
     /**
@@ -150,25 +231,30 @@ public final class JournalWriter implements Closeable {
         return lastFlushedSequence;
     }
 
-    /**
-     * Returns the number of bytes written to the journal file so far.
-     * Safe to call after {@link #close()} to determine how many bytes to compress and upload.
-     */
-    public int writtenBytes() {
+    /** Returns the number of bytes written to the open segment so far. */
+    public int segmentWrittenBytes() {
         return mappedBuffer.position();
     }
 
     /**
-     * Forces any dirty pages to disk. Called periodically to protect against data loss on hard
-     * crash.
+     * Hands the open segment to the segment listener if it holds any records; one without records is deleted.
+     * Nothing is written after.
      */
-    public void flush() {
-        mappedBuffer.force();
-    }
-
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
         closed = true;
-        mappedBuffer.force();
+        if (mappedBuffer.position() == 0) {
+            IoUtil.unmap(mappedBuffer);
+            try {
+                Files.deleteIfExists(segmentPath);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to delete empty journal segment " + segmentPath, e);
+            }
+            return;
+        }
+        segmentListener.accept(finishSegment());
     }
 }
