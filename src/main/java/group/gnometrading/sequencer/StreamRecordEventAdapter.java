@@ -26,14 +26,7 @@ public final class StreamRecordEventAdapter implements SequencedEventHandler {
      */
     public StreamRecordEventAdapter(EventHandler<StreamRecord> delegate) {
         this.delegate = delegate;
-        int maxTemplateId = 0;
-        for (RecordType type : RecordType.values()) {
-            maxTemplateId = Math.max(maxTemplateId, type.templateId());
-        }
-        this.recordsByTemplateId = new StreamRecord[maxTemplateId + 1];
-        for (RecordType type : RecordType.values()) {
-            this.recordsByTemplateId[type.templateId()] = type.newInstance();
-        }
+        this.recordsByTemplateId = RecordType.newRecordsByTemplateId();
     }
 
     @Override
