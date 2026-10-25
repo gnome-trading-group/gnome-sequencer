@@ -7,9 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import group.gnometrading.schemas.Intent;
 import group.gnometrading.schemas.IntentDecoder;
-import group.gnometrading.schemas.Mbp10Decoder;
 import group.gnometrading.schemas.Mbp10Schema;
 import group.gnometrading.schemas.MessageHeaderDecoder;
+import group.gnometrading.schemas.book.Mbp10Decoder;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;

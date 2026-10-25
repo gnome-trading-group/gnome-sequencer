@@ -1,12 +1,11 @@
 package group.gnometrading.sequencer;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import group.gnometrading.schemas.MessageHeaderEncoder;
 import group.gnometrading.schemas.MetricColumnDecoder;
 import group.gnometrading.schemas.MetricRowDecoder;
 import group.gnometrading.schemas.MetricStreamDecoder;
+import group.gnometrading.schemas.SbeMessage;
 import group.gnometrading.sequencer.metrics.MetricLimits;
 import java.io.InputStream;
 import java.util.List;
@@ -22,8 +21,8 @@ import uk.co.real_logic.sbe.xml.ParserOptions;
 import uk.co.real_logic.sbe.xml.XmlSchemaParser;
 
 /**
- * Every ring slot and journal record is sized by {@link SequencedEvent#MAX_MESSAGE_SIZE}. Read from the schema the
- * codecs are generated from, so a message added or grown later is checked without anyone listing it here.
+ * Every ring slot and journal record is sized by {@link SequencedEvent#MAX_MESSAGE_SIZE}. Read from every schema the
+ * codecs are generated from, so a message or family added or grown later is checked without anyone listing it here.
  */
 class SchemaSlotSizeTest {
 
@@ -37,9 +36,18 @@ class SchemaSlotSizeTest {
     private static final Map<String, Integer> MESSAGE_SIZES = new TreeMap<>();
     private static final Map<String, Integer> METRIC_SIZES = new TreeMap<>();
 
+    private static final List<String> SCHEMAS = List.of("core.xml", "book.xml");
+
     @BeforeAll
-    static void readSchema() throws Exception {
-        try (InputStream xml = SchemaSlotSizeTest.class.getClassLoader().getResourceAsStream("schema.xml")) {
+    static void readSchemas() throws Exception {
+        for (String schema : SCHEMAS) {
+            readSchema(schema);
+        }
+        assertTrue(METRIC_SIZES.size() == METRIC_TEMPLATES.size(), "Every metric message is in the schema");
+    }
+
+    private static void readSchema(String schema) throws Exception {
+        try (InputStream xml = SchemaSlotSizeTest.class.getClassLoader().getResourceAsStream(schema)) {
             Ir ir = new IrGenerator()
                     .generate(XmlSchemaParser.parse(
                             xml,
@@ -49,14 +57,13 @@ class SchemaSlotSizeTest {
                                     .build()));
             for (List<Token> message : ir.messages()) {
                 Token begin = message.get(0);
-                int size = MessageHeaderEncoder.ENCODED_LENGTH + begin.encodedLength();
+                int size = SbeMessage.HEADER_LENGTH + begin.encodedLength();
                 MESSAGE_SIZES.put(begin.name(), size);
                 if (METRIC_TEMPLATES.contains((int) begin.id())) {
                     METRIC_SIZES.put(begin.name(), size);
                 }
             }
         }
-        assertTrue(METRIC_SIZES.size() == METRIC_TEMPLATES.size(), "Every metric message is in the schema");
     }
 
     @Test
@@ -78,11 +85,6 @@ class SchemaSlotSizeTest {
                 size < largestOther,
                 name + "'s fixed part (" + size + " bytes) must stay smaller than the largest other message ("
                         + largestOther + "); metrics fit the slot, they don't size it"));
-        assertFalse(
-                MESSAGE_SIZES.entrySet().stream()
-                        .filter(entry -> entry.getValue() == SequencedEvent.MAX_MESSAGE_SIZE)
-                        .allMatch(entry -> METRIC_SIZES.containsKey(entry.getKey())),
-                "The slot is sized by a message that isn't a metric");
     }
 
     @Test

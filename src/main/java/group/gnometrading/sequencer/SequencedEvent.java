@@ -1,16 +1,14 @@
 package group.gnometrading.sequencer;
 
 import com.lmax.disruptor.EventFactory;
-import group.gnometrading.schemas.Mbp10Encoder;
-import group.gnometrading.schemas.MessageHeaderEncoder;
 import group.gnometrading.utils.ByteBufferUtils;
 import org.agrona.concurrent.UnsafeBuffer;
 
 public final class SequencedEvent {
 
-    // Sized to fit the largest SBE message (Mbp10: 374 block + 8 header). Metric rows are capped to fit it rather
-    // than growing it; SchemaSlotSizeTest holds both.
-    public static final int MAX_MESSAGE_SIZE = MessageHeaderEncoder.ENCODED_LENGTH + Mbp10Encoder.BLOCK_LENGTH;
+    // A fixed size rather than the largest message's, so a family can add a record without resizing every ring and
+    // journal; SchemaSlotSizeTest holds every message of every schema to it. Metric rows are capped to fit it.
+    public static final int MAX_MESSAGE_SIZE = 1024;
 
     public static final EventFactory<SequencedEvent> FACTORY = SequencedEvent::new;
 

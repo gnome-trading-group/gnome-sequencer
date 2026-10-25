@@ -3,8 +3,8 @@ package group.gnometrading.sequencer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-import group.gnometrading.schemas.Mbp10Decoder;
 import group.gnometrading.schemas.Mbp10Schema;
+import group.gnometrading.schemas.book.Mbp10Decoder;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -41,7 +41,7 @@ class SequencedRingBufferTest {
 
         for (int i = 0; i < eventCount; i++) {
             Mbp10Schema schema = ringBuffer.claim();
-            schema.encoder.exchangeId((short) i);
+            schema.encoder.streamId(i);
             ringBuffer.publish();
         }
 

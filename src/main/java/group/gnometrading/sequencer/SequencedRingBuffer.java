@@ -78,7 +78,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      */
     public void publish() {
         this.claimedEvent.globalSequence = globalSequence.next();
-        this.claimedEvent.templateId = this.schema.messageHeaderDecoder.templateId();
+        this.claimedEvent.templateId = this.schema.templateId();
         this.claimedEvent.bufferLength = this.schema.totalMessageSize();
         this.claimedEvent.buffer.putBytes(0, this.schema.buffer, 0, this.schema.totalMessageSize());
         this.ringBuffer.publish(this.claimedDisruptorSequence);

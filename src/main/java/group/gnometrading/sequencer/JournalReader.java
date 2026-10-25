@@ -1,6 +1,6 @@
 package group.gnometrading.sequencer;
 
-import group.gnometrading.schemas.MessageHeaderDecoder;
+import group.gnometrading.schemas.SbeMessage;
 import group.gnometrading.schemas.migration.SbeMigrator;
 import java.io.Closeable;
 import java.io.IOException;
@@ -19,12 +19,10 @@ import org.agrona.concurrent.UnsafeBuffer;
  * passed to the callback is a pre-allocated flyweight that is reused across calls;
  * callers must not retain a reference beyond the callback.
  *
- * <p>Records written by an older schema version are migrated to the current one before the callback
+ * <p>Records written by an older version of their schema are migrated to its current one before the callback
  * sees them, so a journal outlives schema changes. Only those records are copied.
  */
 public final class JournalReader implements Closeable {
-
-    private static final int UINT16_MASK = 0xFFFF;
 
     private final MappedByteBuffer mappedBuffer;
     private final UnsafeBuffer payloadFlyweight;
@@ -102,10 +100,8 @@ public final class JournalReader implements Closeable {
     }
 
     private boolean isOlderGnomeMessage(final int length) {
-        return length >= MessageHeaderDecoder.ENCODED_LENGTH
-                && (payloadFlyweight.getShort(MessageHeaderDecoder.schemaIdEncodingOffset(), ByteOrder.LITTLE_ENDIAN)
-                                & UINT16_MASK)
-                        == MessageHeaderDecoder.SCHEMA_ID
+        return length >= SbeMessage.HEADER_LENGTH
+                && SbeMigrator.isGnomeSchema(SbeMessage.schemaId(payloadFlyweight, 0))
                 && SbeMigrator.needsMigration(payloadFlyweight, 0);
     }
 
