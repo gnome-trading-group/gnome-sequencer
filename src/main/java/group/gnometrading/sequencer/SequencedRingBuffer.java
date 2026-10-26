@@ -48,11 +48,32 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     }
 
     public SequencedRingBuffer(EventFactory<T> schemaFactory, GlobalSequence globalSequence, int size) {
+        this(schemaFactory, globalSequence, size, Producers.ONE_THREAD);
+    }
+
+    /**
+     * Who publishes. A ring's claim and publish are never safe to interleave, so producers always publish one at a
+     * time; the choice is whether that is always the same thread.
+     */
+    public enum Producers {
+        /** One thread publishes for the ring's whole life. */
+        ONE_THREAD,
+        /**
+         * Producers take turns, each handing over to the next with a happens-before edge (one stops, then the next
+         * starts): a feed's markets move between connections, each read by its own thread.
+         */
+        TAKING_TURNS
+    }
+
+    public SequencedRingBuffer(
+            EventFactory<T> schemaFactory, GlobalSequence globalSequence, int size, Producers producers) {
         this.globalSequence = globalSequence;
         this.schema = schemaFactory.newInstance();
         // Pollers never wait on the strategy. Sleeping's signalAllWhenBlocking is a no-op, so publish()
         // pays nothing for it, unlike BlockingWaitStrategy's lock + notifyAll.
-        this.ringBuffer = RingBuffer.createSingleProducer(SequencedEvent.FACTORY, size, new SleepingWaitStrategy());
+        this.ringBuffer = producers == Producers.ONE_THREAD
+                ? RingBuffer.createSingleProducer(SequencedEvent.FACTORY, size, new SleepingWaitStrategy())
+                : RingBuffer.createMultiProducer(SequencedEvent.FACTORY, size, new SleepingWaitStrategy());
         globalSequence.register(this);
     }
 

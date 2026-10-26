@@ -101,4 +101,29 @@ class SequencedRingBufferTest {
             assertEquals(i + 1, received.get(i));
         }
     }
+
+    /** A feed's market moves between connections, each read on its own thread; they take turns, never interleave. */
+    @Test
+    void producersOnDifferentThreadsCanTakeTurns() throws Exception {
+        SequencedRingBuffer<Mbp10Schema> ring = new SequencedRingBuffer<>(
+                Mbp10Schema::new, new GlobalSequence(), 64, SequencedRingBuffer.Producers.TAKING_TURNS);
+        List<Long> seen = new ArrayList<>();
+        SequencedPoller poller = ring.createPoller((seq, templateId, buffer, length) -> seen.add(seq));
+        for (int turn = 0; turn < 3; turn++) {
+            Thread producer = new Thread(() -> {
+                for (int i = 0; i < 5; i++) {
+                    ring.claim();
+                    ring.publish();
+                }
+            });
+            producer.start();
+            producer.join();
+        }
+        while (poller.poll() > 0) {}
+
+        assertEquals(15, seen.size());
+        for (int i = 1; i < seen.size(); i++) {
+            assertEquals(seen.get(i - 1) + 1, seen.get(i));
+        }
+    }
 }
