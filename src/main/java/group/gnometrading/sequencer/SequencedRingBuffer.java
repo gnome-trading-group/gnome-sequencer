@@ -6,6 +6,7 @@ import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.SleepingWaitStrategy;
 import group.gnometrading.schemas.SbeMessage;
 import java.util.concurrent.locks.LockSupport;
+import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
@@ -129,13 +130,40 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * @throws RingBufferStoppedException if the ring is stopped, or the thread interrupted, while waiting for room
      */
     public void publishRaw(UnsafeBuffer src, int templateId, int length) {
+        publishRaw(src, 0, templateId, length);
+    }
+
+    /**
+     * As {@link #publishRaw(UnsafeBuffer, int, int)}, copying {@code length} bytes from {@code offset}: for a message
+     * that sits inside a larger buffer, such as an Aeron fragment, so it needn't be copied to offset 0 first.
+     */
+    public void publishRaw(DirectBuffer src, int offset, int templateId, int length) {
         long seq = nextSequence();
         SequencedEvent event = this.ringBuffer.get(seq);
         event.globalSequence = this.globalSequence.next();
         event.templateId = templateId;
         event.bufferLength = length;
-        event.buffer.putBytes(0, src, 0, length);
+        event.buffer.putBytes(0, src, offset, length);
         this.ringBuffer.publish(seq);
+    }
+
+    /**
+     * As {@link #publishRaw(DirectBuffer, int, int, int)}, but never waits: returns false, publishing nothing, while the
+     * slowest poller is a whole ring behind. For a producer that must not block, such as an Aeron poller that leaves the
+     * message in its log and retries. One producer only: with room seen, the slot is this caller's.
+     */
+    public boolean tryPublishRaw(DirectBuffer src, int offset, int templateId, int length) {
+        if (!this.ringBuffer.hasAvailableCapacity(1)) {
+            return false;
+        }
+        long seq = this.ringBuffer.next();
+        SequencedEvent event = this.ringBuffer.get(seq);
+        event.globalSequence = this.globalSequence.next();
+        event.templateId = templateId;
+        event.bufferLength = length;
+        event.buffer.putBytes(0, src, offset, length);
+        this.ringBuffer.publish(seq);
+        return true;
     }
 
     /**
