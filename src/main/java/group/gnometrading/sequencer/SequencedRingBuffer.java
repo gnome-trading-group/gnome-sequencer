@@ -107,6 +107,14 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     }
 
     /**
+     * Creates a {@link LappingPoller}: a reader that never holds the producer back and is lapped instead when it falls a
+     * whole ring behind. Like {@link #createPoller}, it sees only events published after it is created.
+     */
+    public LappingPoller createLappingPoller(SequencedEventHandler handler) {
+        return new LappingPoller(this.ringBuffer, handler);
+    }
+
+    /**
      * Creates a {@link SequencedPoller} for polling this ring buffer from a
      * {@link group.gnometrading.concurrent.GnomeAgent} doWork() loop.
      *
@@ -138,6 +146,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * that sits inside a larger buffer, such as an Aeron fragment, so it needn't be copied to offset 0 first.
      */
     public void publishRaw(DirectBuffer src, int offset, int templateId, int length) {
+        checkLength(length);
         long seq = nextSequence();
         SequencedEvent event = this.ringBuffer.get(seq);
         event.globalSequence = this.globalSequence.next();
@@ -150,9 +159,11 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     /**
      * As {@link #publishRaw(DirectBuffer, int, int, int)}, but never waits: returns false, publishing nothing, while the
      * slowest poller is a whole ring behind. For a producer that must not block, such as an Aeron poller that leaves the
-     * message in its log and retries. One producer only: with room seen, the slot is this caller's.
+     * message in its log and retries. Producers must publish one at a time ({@link Producers}): with room seen, the slot
+     * is this caller's.
      */
     public boolean tryPublishRaw(DirectBuffer src, int offset, int templateId, int length) {
+        checkLength(length);
         if (!this.ringBuffer.hasAvailableCapacity(1)) {
             return false;
         }
@@ -164,6 +175,14 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
         event.buffer.putBytes(0, src, offset, length);
         this.ringBuffer.publish(seq);
         return true;
+    }
+
+    /** Before claiming a slot: a message that can't fit would leave the claimed slot unpublished for good. */
+    private static void checkLength(int length) {
+        if (length < 0 || length > SequencedEvent.MAX_MESSAGE_SIZE) {
+            throw new IllegalArgumentException("A message of " + length + " bytes doesn't fit a "
+                    + SequencedEvent.MAX_MESSAGE_SIZE + "-byte slot");
+        }
     }
 
     /**
