@@ -62,6 +62,59 @@ class LappingPollerTest {
     }
 
     @Test
+    void aHeldEventStopsThePollAndComesFirstInTheNext() throws Exception {
+        final SequencedRingBuffer<Mbp10Schema> ring =
+                new SequencedRingBuffer<>(Mbp10Schema::new, new GlobalSequence(), 8);
+        final List<Long> seen = new ArrayList<>();
+        final boolean[] refuse = {true};
+        final LappingPoller reader = ring.createControlledLappingPoller((seq, templateId, buffer, length) -> {
+            final long sequence = sequenceOf(buffer);
+            if (sequence == 3 && refuse[0]) {
+                return false;
+            }
+            seen.add(sequence);
+            return true;
+        });
+
+        for (int i = 1; i <= 5; i++) {
+            publish(ring, i);
+        }
+        assertEquals(2, reader.poll());
+        assertEquals(0, reader.poll(), "still held");
+        refuse[0] = false;
+        assertEquals(3, reader.poll());
+
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), seen);
+        assertEquals(0, reader.lapped());
+    }
+
+    @Test
+    void holdingNeverSlowsTheProducerSoAHeldEventCanBeLappedPast() throws Exception {
+        final SequencedRingBuffer<Mbp10Schema> ring =
+                new SequencedRingBuffer<>(Mbp10Schema::new, new GlobalSequence(), 8);
+        final List<Long> seen = new ArrayList<>();
+        final boolean[] refuse = {true};
+        final LappingPoller reader = ring.createControlledLappingPoller((seq, templateId, buffer, length) -> {
+            if (refuse[0]) {
+                return false;
+            }
+            seen.add(sequenceOf(buffer));
+            return true;
+        });
+
+        publish(ring, 1);
+        assertEquals(0, reader.poll());
+        for (int i = 2; i <= 12; i++) {
+            assertTrue(ring.tryPublishRaw(encoded(i), 0, templateId(), length()));
+        }
+        refuse[0] = false;
+        assertEquals(8, reader.poll());
+
+        assertEquals(List.of(5L, 6L, 7L, 8L, 9L, 10L, 11L, 12L), seen);
+        assertEquals(4, reader.lapped());
+    }
+
+    @Test
     void aMessageTooBigForASlotIsRefusedBeforeASlotIsClaimed() throws Exception {
         final SequencedRingBuffer<Mbp10Schema> ring =
                 new SequencedRingBuffer<>(Mbp10Schema::new, new GlobalSequence(), 8);

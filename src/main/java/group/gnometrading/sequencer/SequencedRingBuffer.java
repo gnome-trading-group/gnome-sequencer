@@ -111,6 +111,17 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * whole ring behind. Like {@link #createPoller}, it sees only events published after it is created.
      */
     public LappingPoller createLappingPoller(SequencedEventHandler handler) {
+        return new LappingPoller(this.ringBuffer, (globalSequence, templateId, buffer, length) -> {
+            handler.onSequencedEvent(globalSequence, templateId, buffer, length);
+            return true;
+        });
+    }
+
+    /**
+     * As {@link #createLappingPoller}, but the handler may hold an event it can't take yet, which the next poll hands it
+     * again; holding never slows the producer, so a reader that holds too long is lapped past the event.
+     */
+    public LappingPoller createControlledLappingPoller(ControlledSequencedEventHandler handler) {
         return new LappingPoller(this.ringBuffer, handler);
     }
 
