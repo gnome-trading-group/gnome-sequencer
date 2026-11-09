@@ -21,4 +21,15 @@ public interface JournalRecordHandler {
      * @param length the number of valid bytes in {@code buffer}
      */
     void onRecord(long globalSequence, int sourceId, int templateId, UnsafeBuffer buffer, int length);
+
+    /**
+     * Called in place of the records a journal lost, for a journal written to skip lost events. Fails unless
+     * overridden: a replay that needs every record must not carry on past a hole.
+     *
+     * @param firstLost the first global sequence lost
+     * @param lastLost the last global sequence lost, inclusive
+     */
+    default void onGap(long firstLost, long lastLost) {
+        throw new IllegalStateException("Journal lost global sequences " + firstLost + " to " + lastLost);
+    }
 }

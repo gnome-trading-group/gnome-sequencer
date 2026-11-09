@@ -35,6 +35,14 @@ import org.agrona.concurrent.UnsafeBuffer;
  * journal. Several buffers carry copies of the same message (an order and its routed copy),
  * and replay needs to tell them apart.
  *
+ * <p>A journal may be opened to {@linkplain #JournalWriter(Path, long, Consumer, boolean) skip lost
+ * events}, for buffers read by {@link LappingPoller}s, which drop what they are lapped past. Global
+ * sequences that never arrive are then written as one gap record per missing run instead of stalling
+ * or failing the journal: source {@link #GAP_SOURCE_ID}, template {@link #GAP_TEMPLATE_ID}, the
+ * header's sequence the first one lost and an 8-byte payload the last one lost. A lost event that
+ * arrives after its gap was written is dropped and counted. Without that option every global
+ * sequence must arrive, and a missing one fails the journal.
+ *
  * <p>A segment ends when the next record doesn't fit or when {@link #roll()} is called, and is handed to the
  * segment listener to {@link JournalSegment#seal seal}, so another process can ship the journal while the session
  * runs. A record never spans two segments, and a segment with no records is never handed on.
@@ -49,6 +57,12 @@ import org.agrona.concurrent.UnsafeBuffer;
 public final class JournalWriter implements Closeable {
 
     static final int HEADER_SIZE = Long.BYTES + Short.BYTES + Short.BYTES + Short.BYTES;
+    /** The source id of a gap record; no journaled buffer may use it. */
+    public static final int GAP_SOURCE_ID = 0xFFFF;
+    /** The template id of a gap record. */
+    public static final int GAP_TEMPLATE_ID = 0;
+
+    static final int GAP_PAYLOAD_SIZE = Long.BYTES;
 
     // Reorder buffer sized as a power-of-2 to allow bitwise-mask indexing.
     private static final int REORDER_BUFFER_CAPACITY = 1 << 8;
@@ -63,12 +77,16 @@ public final class JournalWriter implements Closeable {
     private final Path directory;
     private final long segmentSizeBytes;
     private final Consumer<JournalSegment> segmentListener;
+    private final boolean skipsLost;
 
     private MappedByteBuffer mappedBuffer;
     private Path segmentPath;
     private int segmentIndex;
     private long segmentFirstSequence;
     private long lastFlushedSequence;
+    private long highestReceived;
+    private long lostSequences;
+    private long lateEvents;
     private boolean closed;
 
     /**
@@ -80,6 +98,21 @@ public final class JournalWriter implements Closeable {
      * @throws IOException if the directory or first segment cannot be created
      */
     public JournalWriter(Path directory, long segmentSizeBytes, Consumer<JournalSegment> segmentListener)
+            throws IOException {
+        this(directory, segmentSizeBytes, segmentListener, false);
+    }
+
+    /**
+     * Opens a journal in {@code directory}, starting with its first segment.
+     *
+     * @param directory where the segment files go; created if missing
+     * @param segmentSizeBytes the size of each memory-mapped segment in bytes
+     * @param segmentListener called on the writing thread with each finished segment; must hand it off quickly
+     * @param skipsLost whether global sequences that never arrive are written as gaps rather than failing the journal
+     * @throws IOException if the directory or first segment cannot be created
+     */
+    public JournalWriter(
+            Path directory, long segmentSizeBytes, Consumer<JournalSegment> segmentListener, boolean skipsLost)
             throws IOException {
         if (segmentSizeBytes < HEADER_SIZE + SequencedEvent.MAX_MESSAGE_SIZE || segmentSizeBytes > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
@@ -96,6 +129,7 @@ public final class JournalWriter implements Closeable {
         this.directory = directory;
         this.segmentSizeBytes = segmentSizeBytes;
         this.segmentListener = segmentListener;
+        this.skipsLost = skipsLost;
         this.lastFlushedSequence = 0;
         this.closed = false;
         Files.createDirectories(directory);
@@ -125,10 +159,12 @@ public final class JournalWriter implements Closeable {
     }
 
     /**
-     * Buffers one event and writes every record that is now contiguous in global sequence order.
+     * Buffers one event and writes every record that is now contiguous in global sequence order. When skipping lost
+     * events, one too far ahead of the last written record to fit in the reorder buffer first writes the oldest
+     * missing sequences as lost, and one at or before the last written record is dropped.
      *
-     * @throws IllegalStateException if the event was already journaled, or if it is too far ahead
-     *     of the last written record to fit in the reorder buffer — which means some earlier global
+     * @throws IllegalStateException unless skipping lost events: if the event was already journaled, or if it is too
+     *     far ahead of the last written record to fit in the reorder buffer — which means some earlier global
      *     sequence number was taken by a buffer that is not journaled
      */
     public void append(int sourceId, long globalSequence, int templateId, UnsafeBuffer buffer, int length) {
@@ -136,12 +172,19 @@ public final class JournalWriter implements Closeable {
             return;
         }
         if (globalSequence <= lastFlushedSequence) {
+            if (skipsLost) {
+                lateEvents++;
+                return;
+            }
             throw new IllegalStateException("Journal already wrote global sequence " + globalSequence);
         }
         if (globalSequence > lastFlushedSequence + REORDER_BUFFER_CAPACITY) {
-            throw new IllegalStateException("Journal gap: still waiting for global sequence "
-                    + (lastFlushedSequence + 1) + " but received " + globalSequence
-                    + "; a buffer on this sequence is not journaled");
+            if (!skipsLost) {
+                throw new IllegalStateException("Journal gap: still waiting for global sequence "
+                        + (lastFlushedSequence + 1) + " but received " + globalSequence
+                        + "; a buffer on this sequence is not journaled");
+            }
+            skipLostBelow(globalSequence - REORDER_BUFFER_CAPACITY + 1);
         }
         int slot = (int) (globalSequence & REORDER_BUFFER_MASK);
         reorderSequences[slot] = globalSequence;
@@ -149,7 +192,66 @@ public final class JournalWriter implements Closeable {
         reorderTemplateIds[slot] = templateId;
         reorderLengths[slot] = length;
         reorderPayloads[slot].putBytes(0, buffer, 0, length);
+        highestReceived = Math.max(highestReceived, globalSequence);
         flushContiguous();
+    }
+
+    /**
+     * Writes every global sequence still missing below the highest one received as lost, and with it every record
+     * that was waiting behind them. For when a reader was lapped: what it skipped will never arrive. Poll every
+     * journaled buffer first, so events merely not read yet aren't taken for lost.
+     *
+     * @return how many global sequences were written as lost
+     * @throws IllegalStateException if the journal wasn't opened to skip lost events
+     */
+    public long skipMissing() {
+        if (!skipsLost) {
+            throw new IllegalStateException("This journal requires every global sequence; it can't skip any");
+        }
+        if (closed) {
+            return 0;
+        }
+        final long before = lostSequences;
+        skipLostBelow(highestReceived + 1);
+        return lostSequences - before;
+    }
+
+    private void skipLostBelow(long below) {
+        while (lastFlushedSequence + 1 < below) {
+            final long first = lastFlushedSequence + 1;
+            if (!isBuffered(first)) {
+                // Nothing past the reorder buffer's reach can be buffered yet, so a run reaching it runs to the end.
+                final long scanEnd = Math.min(below - 1, lastFlushedSequence + REORDER_BUFFER_CAPACITY);
+                long last = first;
+                while (last < scanEnd && !isBuffered(last + 1)) {
+                    last++;
+                }
+                writeGap(first, last == scanEnd ? below - 1 : last);
+            }
+            flushContiguous();
+        }
+    }
+
+    private boolean isBuffered(long globalSequence) {
+        return reorderSequences[(int) (globalSequence & REORDER_BUFFER_MASK)] == globalSequence;
+    }
+
+    private void writeGap(long first, long last) {
+        MappedByteBuffer mapped = mappedBuffer;
+        if (mapped.remaining() < HEADER_SIZE + GAP_PAYLOAD_SIZE) {
+            roll();
+            mapped = mappedBuffer;
+        }
+        if (mapped.position() == 0) {
+            segmentFirstSequence = first;
+        }
+        mapped.putLong(first);
+        mapped.putShort((short) GAP_SOURCE_ID);
+        mapped.putShort((short) GAP_TEMPLATE_ID);
+        mapped.putShort((short) GAP_PAYLOAD_SIZE);
+        mapped.putLong(last);
+        lastFlushedSequence = last;
+        lostSequences += last - first + 1;
     }
 
     private void flushContiguous() {
@@ -231,6 +333,16 @@ public final class JournalWriter implements Closeable {
         return lastFlushedSequence;
     }
 
+    /** Global sequences written as lost. */
+    public long lostSequences() {
+        return lostSequences;
+    }
+
+    /** Events dropped because they arrived after their sequence was written as lost. */
+    public long lateEvents() {
+        return lateEvents;
+    }
+
     /** Returns the number of bytes written to the open segment so far. */
     public int segmentWrittenBytes() {
         return mappedBuffer.position();
@@ -238,12 +350,16 @@ public final class JournalWriter implements Closeable {
 
     /**
      * Hands the open segment to the segment listener if it holds any records; one without records is deleted.
-     * Nothing is written after.
+     * Nothing is written after. When skipping lost events, whatever is still missing is written as lost first, so
+     * no record waiting behind it is left out.
      */
     @Override
     public void close() {
         if (closed) {
             return;
+        }
+        if (skipsLost) {
+            skipMissing();
         }
         closed = true;
         if (mappedBuffer.position() == 0) {

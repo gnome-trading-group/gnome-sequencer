@@ -60,8 +60,9 @@ public final class JournalReader implements Closeable {
     /**
      * Reads all remaining records from the journal and dispatches each to the handler.
      *
-     * <p>Records are validated to be monotonically increasing. The {@code buffer} parameter
-     * passed to the handler is a reused flyweight — do not retain it across calls.
+     * <p>Records are validated to be monotonically increasing; a gap record goes to
+     * {@link JournalRecordHandler#onGap}. The {@code buffer} parameter passed to the handler is a
+     * reused flyweight — do not retain it across calls.
      *
      * @param handler the callback to invoke for each record
      * @throws IllegalStateException if a sequence gap or regression is detected
@@ -86,6 +87,11 @@ public final class JournalReader implements Closeable {
                 break;
             }
 
+            if (sourceId == JournalWriter.GAP_SOURCE_ID && templateId == JournalWriter.GAP_TEMPLATE_ID) {
+                readGap(globalSequence, length, handler);
+                continue;
+            }
+
             mappedBuffer.get(payloadFlyweight.byteArray(), 0, length);
             payloadFlyweight.wrap(payloadFlyweight.byteArray(), 0, length);
 
@@ -97,6 +103,18 @@ public final class JournalReader implements Closeable {
                 handler.onRecord(globalSequence, sourceId, templateId, payloadFlyweight, length);
             }
         }
+    }
+
+    private void readGap(long firstLost, int length, JournalRecordHandler handler) {
+        if (length != JournalWriter.GAP_PAYLOAD_SIZE) {
+            throw new IllegalStateException("Journal gap record at " + firstLost + " has " + length + " bytes");
+        }
+        long lastLost = mappedBuffer.getLong();
+        if (lastLost < firstLost) {
+            throw new IllegalStateException("Journal gap record ends at " + lastLost + " before " + firstLost);
+        }
+        lastReadSequence = lastLost;
+        handler.onGap(firstLost, lastLost);
     }
 
     private boolean isOlderGnomeMessage(final int length) {
