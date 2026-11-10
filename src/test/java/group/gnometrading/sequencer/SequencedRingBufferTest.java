@@ -3,6 +3,7 @@ package group.gnometrading.sequencer;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import group.gnometrading.schemas.Mbp10Schema;
@@ -101,6 +102,32 @@ class SequencedRingBufferTest {
         SequencedPoller poller = ringBuffer.createPoller((gSeq, templateId, buffer, length) -> {});
 
         assertEquals(0, poller.poll());
+    }
+
+    @Test
+    void aLimitedPollTakesAtMostItsLimitAndTheNextCarriesOn() throws Exception {
+        SequencedRingBuffer<Mbp10Schema> ringBuffer = new SequencedRingBuffer<>(Mbp10Schema::new, new GlobalSequence());
+        List<Long> seen = new ArrayList<>();
+        SequencedPoller poller = ringBuffer.createPoller((gSeq, templateId, buffer, length) -> seen.add(gSeq));
+        for (int i = 0; i < 5; i++) {
+            ringBuffer.claim();
+            ringBuffer.publish();
+        }
+
+        assertEquals(2, poller.poll(2));
+        assertEquals(List.of(1L, 2L), seen);
+        assertEquals(2, poller.poll(2));
+        assertEquals(1, poller.poll(2));
+        assertEquals(0, poller.poll(2));
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), seen);
+    }
+
+    @Test
+    void aPollLimitBelowOneIsRefused() {
+        SequencedRingBuffer<Mbp10Schema> ringBuffer = new SequencedRingBuffer<>(Mbp10Schema::new, new GlobalSequence());
+        SequencedPoller poller = ringBuffer.createPoller((gSeq, templateId, buffer, length) -> {});
+
+        assertThrows(IllegalArgumentException.class, () -> poller.poll(0));
     }
 
     @Test

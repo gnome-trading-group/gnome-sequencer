@@ -9,6 +9,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.function.Consumer;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -64,8 +66,13 @@ public final class JournalWriter implements Closeable {
 
     static final int GAP_PAYLOAD_SIZE = Long.BYTES;
 
-    // Reorder buffer sized as a power-of-2 to allow bitwise-mask indexing.
-    private static final int REORDER_BUFFER_CAPACITY = 1 << 8;
+    /**
+     * How far ahead of the last written record an event may arrive. Sized for a producer stalled between taking its
+     * number and publishing (seconds of a busy market data ring), and a power of two for mask indexing. Each slot holds
+     * a full payload, so this is the writer's memory: 4,096 slots of 1 KB.
+     */
+    public static final int REORDER_BUFFER_CAPACITY = 1 << 12;
+
     private static final int REORDER_BUFFER_MASK = REORDER_BUFFER_CAPACITY - 1;
 
     private final long[] reorderSequences;
@@ -181,8 +188,9 @@ public final class JournalWriter implements Closeable {
         if (globalSequence > lastFlushedSequence + REORDER_BUFFER_CAPACITY) {
             if (!skipsLost) {
                 throw new IllegalStateException("Journal gap: still waiting for global sequence "
-                        + (lastFlushedSequence + 1) + " but received " + globalSequence
-                        + "; a buffer on this sequence is not journaled");
+                        + (lastFlushedSequence + 1) + " but received " + globalSequence + " from source " + sourceId
+                        + "; waiting by source " + waitingBySource()
+                        + "; a buffer on this sequence is not journaled, or one of its producers stalled");
             }
             skipLostBelow(globalSequence - REORDER_BUFFER_CAPACITY + 1);
         }
@@ -230,6 +238,17 @@ public final class JournalWriter implements Closeable {
             }
             flushContiguous();
         }
+    }
+
+    /** Source id → events buffered behind the missing one, for the gap error. Allocates; the failure path only. */
+    private Map<Integer, Integer> waitingBySource() {
+        final Map<Integer, Integer> waiting = new TreeMap<>();
+        for (long sequence = lastFlushedSequence + 1; sequence <= highestReceived; sequence++) {
+            if (isBuffered(sequence)) {
+                waiting.merge(reorderSourceIds[(int) (sequence & REORDER_BUFFER_MASK)], 1, Integer::sum);
+            }
+        }
+        return waiting;
     }
 
     private boolean isBuffered(long globalSequence) {

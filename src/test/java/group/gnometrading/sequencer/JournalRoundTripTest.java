@@ -157,13 +157,30 @@ class JournalRoundTripTest {
 
         // Sequence 2 never reaches the journal; everything after it waits until the window overflows.
         IllegalStateException gap = assertThrows(IllegalStateException.class, () -> {
-            for (int i = 0; i < SequencedRingBuffer.DEFAULT_SIZE; i++) {
+            for (int i = 0; i < JournalWriter.REORDER_BUFFER_CAPACITY; i++) {
                 journaled.claim();
                 journaled.publish();
                 poller.poll();
             }
         });
         assertTrue(gap.getMessage().contains("waiting for global sequence 2"), gap.getMessage());
+        assertTrue(
+                gap.getMessage().contains("waiting by source {1=" + (JournalWriter.REORDER_BUFFER_CAPACITY - 1) + "}"),
+                gap.getMessage());
+        writer.close();
+    }
+
+    @Test
+    void anEventAWholeWindowLessOneAheadWaitsForTheMissingOne() throws IOException {
+        JournalWriter writer = new JournalWriter(tempDir.resolve("window.journal"), FILE_SIZE, segments::add);
+        for (long sequence = 2; sequence <= JournalWriter.REORDER_BUFFER_CAPACITY; sequence++) {
+            writer.append(7, sequence, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        }
+        assertEquals(0, writer.lastFlushedSequence());
+
+        writer.append(1, 1, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+
+        assertEquals(JournalWriter.REORDER_BUFFER_CAPACITY, writer.lastFlushedSequence());
         writer.close();
     }
 

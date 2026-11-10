@@ -18,7 +18,7 @@ class JournalLostEventsTest {
 
     private static final long FILE_SIZE = 1024L * 1024L;
     private static final UnsafeBuffer EMPTY = new UnsafeBuffer(new byte[0]);
-    private static final int WINDOW = 256;
+    private static final int WINDOW = JournalWriter.REORDER_BUFFER_CAPACITY;
 
     @TempDir
     Path tempDir;
@@ -116,7 +116,8 @@ class JournalLostEventsTest {
         writer.close();
 
         assertEquals(1_000_000_000L - 2, writer.lostSequences());
-        assertEquals(List.of("1", "2-999999744", "999999745-999999999", "1000000000"), replay());
+        long windowStart = 1_000_000_000L - WINDOW;
+        assertEquals(List.of("1", "2-" + windowStart, (windowStart + 1) + "-999999999", "1000000000"), replay());
     }
 
     @Test
