@@ -18,6 +18,7 @@ public final class SequencedPoller implements EventPoller.Handler<SequencedEvent
     private final SequencedEventHandler handler;
     private int polledCount;
     private int limit;
+    private long timestampNanos;
 
     SequencedPoller(EventPoller<SequencedEvent> poller, SequencedEventHandler handler) {
         this.poller = poller;
@@ -51,8 +52,17 @@ public final class SequencedPoller implements EventPoller.Handler<SequencedEvent
         return this.polledCount;
     }
 
+    /**
+     * When the event being handled was published ({@link SequencedEvent#timestampNanos}), for the handler to read
+     * during its callback: its arrival in this process, epoch nanoseconds.
+     */
+    public long timestampNanos() {
+        return this.timestampNanos;
+    }
+
     @Override
     public boolean onEvent(SequencedEvent event, long sequence, boolean endOfBatch) throws Exception {
+        this.timestampNanos = event.timestampNanos;
         this.handler.onSequencedEvent(event.globalSequence, event.templateId, event.buffer, event.bufferLength);
         this.polledCount++;
         return this.polledCount < this.limit;

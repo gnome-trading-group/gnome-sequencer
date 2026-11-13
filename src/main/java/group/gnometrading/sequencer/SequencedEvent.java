@@ -13,6 +13,9 @@ public final class SequencedEvent {
     public static final EventFactory<SequencedEvent> FACTORY = SequencedEvent::new;
 
     public long globalSequence;
+    // When the event was published, in epoch nanoseconds from the ring's clock: the moment it reached this process's
+    // rings, so time spent waiting in a ring counts against whoever reads it.
+    public long timestampNanos;
     public int templateId;
     public int bufferLength;
     public final UnsafeBuffer buffer;

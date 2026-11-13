@@ -5,8 +5,10 @@ import com.lmax.disruptor.EventPoller;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.SleepingWaitStrategy;
 import group.gnometrading.schemas.SbeMessage;
+import group.gnometrading.utils.SampledEpochNanoClock;
 import java.util.concurrent.locks.LockSupport;
 import org.agrona.DirectBuffer;
+import org.agrona.concurrent.EpochNanoClock;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
@@ -15,6 +17,10 @@ import org.agrona.concurrent.UnsafeBuffer;
  * <p>Producers call {@link #claim()} to get the pre-allocated schema flyweight,
  * write into it using the typed SBE encoder, then call {@link #publish()} to assign
  * a global sequence number and make the event visible to consumers.
+ *
+ * <p>Every publish stamps the event with the ring's clock ({@link SequencedEvent#timestampNanos}), which pollers hand
+ * on ({@link SequencedPoller#timestampNanos()}, {@link LappingPoller#timestampNanos()}) and journals record. The
+ * system clock ({@link SampledEpochNanoClock}, allocation-free) unless a clock is given: a simulation passes its own.
  *
  * <p>All operations are zero-allocation. The schema flyweight is pre-allocated and
  * reused on every claim/publish cycle. Safe because each ring buffer has a single
@@ -34,6 +40,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
 
     private final RingBuffer<SequencedEvent> ringBuffer;
     private final GlobalSequence globalSequence;
+    private final EpochNanoClock clock;
 
     // Pre-allocated schema flyweight — returned by claim(), reused each cycle.
     private final T schema;
@@ -52,6 +59,11 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
         this(schemaFactory, globalSequence, size, Producers.ONE_THREAD);
     }
 
+    public SequencedRingBuffer(
+            EventFactory<T> schemaFactory, GlobalSequence globalSequence, int size, EpochNanoClock clock) {
+        this(schemaFactory, globalSequence, size, Producers.ONE_THREAD, clock);
+    }
+
     /**
      * Who publishes. A ring's claim and publish are never safe to interleave, so producers always publish one at a
      * time; the choice is whether that is always the same thread.
@@ -68,7 +80,17 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
 
     public SequencedRingBuffer(
             EventFactory<T> schemaFactory, GlobalSequence globalSequence, int size, Producers producers) {
+        this(schemaFactory, globalSequence, size, producers, SampledEpochNanoClock.INSTANCE);
+    }
+
+    public SequencedRingBuffer(
+            EventFactory<T> schemaFactory,
+            GlobalSequence globalSequence,
+            int size,
+            Producers producers,
+            EpochNanoClock clock) {
         this.globalSequence = globalSequence;
+        this.clock = clock;
         this.schema = schemaFactory.newInstance();
         // Pollers never wait on the strategy. Sleeping's signalAllWhenBlocking is a no-op, so publish()
         // pays nothing for it, unlike BlockingWaitStrategy's lock + notifyAll.
@@ -100,6 +122,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      */
     public void publish() {
         this.claimedEvent.globalSequence = globalSequence.next();
+        this.claimedEvent.timestampNanos = clock.nanoTime();
         this.claimedEvent.templateId = this.schema.templateId();
         this.claimedEvent.bufferLength = this.schema.totalMessageSize();
         this.claimedEvent.buffer.putBytes(0, this.schema.buffer, 0, this.schema.totalMessageSize());
@@ -161,6 +184,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
         long seq = nextSequence();
         SequencedEvent event = this.ringBuffer.get(seq);
         event.globalSequence = this.globalSequence.next();
+        event.timestampNanos = this.clock.nanoTime();
         event.templateId = templateId;
         event.bufferLength = length;
         event.buffer.putBytes(0, src, offset, length);
@@ -181,6 +205,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
         long seq = this.ringBuffer.next();
         SequencedEvent event = this.ringBuffer.get(seq);
         event.globalSequence = this.globalSequence.next();
+        event.timestampNanos = this.clock.nanoTime();
         event.templateId = templateId;
         event.bufferLength = length;
         event.buffer.putBytes(0, src, offset, length);

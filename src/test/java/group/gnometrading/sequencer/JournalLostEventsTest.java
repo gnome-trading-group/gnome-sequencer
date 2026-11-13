@@ -30,7 +30,7 @@ class JournalLostEventsTest {
     }
 
     private static void append(JournalWriter writer, long globalSequence) {
-        writer.append(1, globalSequence, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
+        writer.append(1, globalSequence, 0, Mbp10Decoder.TEMPLATE_ID, EMPTY, 0);
     }
 
     /** Each record as its sequence, each gap as "first-last". */
@@ -38,7 +38,13 @@ class JournalLostEventsTest {
         final List<String> seen = new ArrayList<>();
 
         @Override
-        public void onRecord(long globalSequence, int sourceId, int templateId, UnsafeBuffer buffer, int length) {
+        public void onRecord(
+                long globalSequence,
+                long timestampNanos,
+                int sourceId,
+                int templateId,
+                UnsafeBuffer buffer,
+                int length) {
             seen.add(String.valueOf(globalSequence));
         }
 
@@ -165,8 +171,8 @@ class JournalLostEventsTest {
         GlobalSequence globalSequence = new GlobalSequence();
         SequencedRingBuffer<Intent> fast = new SequencedRingBuffer<>(Intent::new, globalSequence, 8);
         SequencedRingBuffer<Intent> slow = new SequencedRingBuffer<>(Intent::new, globalSequence);
-        LappingPoller fastReader = fast.createLappingPoller(writer.source(1));
-        SequencedPoller slowReader = slow.createPoller(writer.source(2));
+        LappingPoller fastReader = writer.journalLapping(fast, 1);
+        SequencedPoller slowReader = writer.journal(slow, 2);
 
         for (int i = 0; i < 20; i++) {
             fast.claim();
@@ -196,7 +202,7 @@ class JournalLostEventsTest {
 
         JournalReader reader = new JournalReader(segments.get(0).path());
         IllegalStateException hole =
-                assertThrows(IllegalStateException.class, () -> reader.readAll((s, src, t, b, l) -> {}));
+                assertThrows(IllegalStateException.class, () -> reader.readAll((s, time, src, t, b, l) -> {}));
         assertTrue(hole.getMessage().contains("lost global sequences 1 to 1"), hole.getMessage());
     }
 

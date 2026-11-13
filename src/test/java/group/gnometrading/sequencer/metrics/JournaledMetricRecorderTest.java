@@ -46,8 +46,8 @@ class JournaledMetricRecorderTest {
         GlobalSequence sequence = new GlobalSequence();
         metrics = new SequencedRingBuffer<>(MetricRow::new, sequence);
         intents = new SequencedRingBuffer<>(Intent::new, sequence);
-        metricPoller = metrics.createPoller(writer.source(METRIC_SOURCE));
-        intentPoller = intents.createPoller(writer.source(INTENT_SOURCE));
+        metricPoller = writer.journal(metrics, METRIC_SOURCE);
+        intentPoller = writer.journal(intents, INTENT_SOURCE);
     }
 
     @Test
@@ -123,7 +123,7 @@ class JournaledMetricRecorderTest {
         for (JournalSegment segment : segments) {
             segment.seal();
             JournalReader reader = new JournalReader(segment.path());
-            reader.readAll((sequence, sourceId, templateId, buffer, length) -> {
+            reader.readAll((sequence, time, sourceId, templateId, buffer, length) -> {
                 if (templateId == IntentDecoder.TEMPLATE_ID) {
                     assertEquals(INTENT_SOURCE, sourceId);
                     records.add(sequence + " intent");

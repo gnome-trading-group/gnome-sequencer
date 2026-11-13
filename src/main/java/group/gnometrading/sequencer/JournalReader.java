@@ -19,13 +19,22 @@ import org.agrona.concurrent.UnsafeBuffer;
  * passed to the callback is a pre-allocated flyweight that is reused across calls;
  * callers must not retain a reference beyond the callback.
  *
+ * <p>Reads both record formats: a segment starting with {@link JournalWriter}'s header holds records with their publish
+ * time; one from before the header holds none, and its records read with a time of {@link #NO_TIMESTAMP}.
+ *
  * <p>Records written by an older version of their schema are migrated to its current one before the callback
  * sees them, so a journal outlives schema changes. Only those records are copied.
  */
 public final class JournalReader implements Closeable {
 
+    /** The time of a record from a segment written before records carried one. */
+    public static final long NO_TIMESTAMP = 0;
+
+    private static final int LEGACY_HEADER_SIZE = Long.BYTES + Short.BYTES + Short.BYTES + Short.BYTES;
+
     private final MappedByteBuffer mappedBuffer;
     private final UnsafeBuffer payloadFlyweight;
+    private final boolean timed;
     // A migrated message has the current layout, so it fits the largest current message.
     private final UnsafeBuffer migratedPayload = new UnsafeBuffer(new byte[SequencedEvent.MAX_MESSAGE_SIZE]);
     private long lastReadSequence;
@@ -55,6 +64,16 @@ public final class JournalReader implements Closeable {
             this.mappedBuffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
             this.mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
         }
+        this.timed = mappedBuffer.remaining() >= JournalWriter.SEGMENT_HEADER_SIZE
+                && mappedBuffer.getInt(0) == JournalWriter.SEGMENT_MAGIC;
+        if (timed) {
+            final int format = Short.toUnsignedInt(mappedBuffer.getShort(Integer.BYTES));
+            if (format != JournalWriter.FORMAT) {
+                throw new IllegalStateException("Journal segment " + path + " has format " + format
+                        + "; this reader reads up to " + JournalWriter.FORMAT);
+            }
+            mappedBuffer.position(JournalWriter.SEGMENT_HEADER_SIZE);
+        }
     }
 
     /**
@@ -68,11 +87,13 @@ public final class JournalReader implements Closeable {
      * @throws IllegalStateException if a sequence gap or regression is detected
      */
     public void readAll(JournalRecordHandler handler) {
-        while (mappedBuffer.remaining() >= JournalWriter.HEADER_SIZE) {
+        final int headerSize = timed ? JournalWriter.HEADER_SIZE : LEGACY_HEADER_SIZE;
+        while (mappedBuffer.remaining() >= headerSize) {
             long globalSequence = mappedBuffer.getLong();
             if (globalSequence == 0) {
                 break;
             }
+            long timestampNanos = timed ? mappedBuffer.getLong() : NO_TIMESTAMP;
 
             int sourceId = Short.toUnsignedInt(mappedBuffer.getShort());
             int templateId = Short.toUnsignedInt(mappedBuffer.getShort());
@@ -98,9 +119,9 @@ public final class JournalReader implements Closeable {
             lastReadSequence = globalSequence;
             if (isOlderGnomeMessage(length)) {
                 final int migratedLength = SbeMigrator.migrateMessage(payloadFlyweight, 0, migratedPayload, 0);
-                handler.onRecord(globalSequence, sourceId, templateId, migratedPayload, migratedLength);
+                handler.onRecord(globalSequence, timestampNanos, sourceId, templateId, migratedPayload, migratedLength);
             } else {
-                handler.onRecord(globalSequence, sourceId, templateId, payloadFlyweight, length);
+                handler.onRecord(globalSequence, timestampNanos, sourceId, templateId, payloadFlyweight, length);
             }
         }
     }

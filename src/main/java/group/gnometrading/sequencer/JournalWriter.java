@@ -24,14 +24,19 @@ import org.agrona.concurrent.UnsafeBuffer;
  * A pre-allocated fixed-size reorder buffer absorbs this skew and flushes contiguous runs
  * in global sequence order to disk.
  *
- * <p>Journal record format (little-endian):
+ * <p>Each segment starts with a {@value #SEGMENT_HEADER_SIZE}-byte header: the magic {@code GNJ2}, the format
+ * ({@value #FORMAT}, uint16) and zeros. Journal record format (little-endian):
  * <pre>
  * [8 bytes] globalSequence (uint64)
+ * [8 bytes] timestampNanos (uint64) when the event was published to its ring, epoch nanoseconds
  * [2 bytes] sourceId      (uint16)
  * [2 bytes] templateId    (uint16)
  * [2 bytes] payloadLength (uint16)
  * [N bytes] SBE payload
  * </pre>
+ *
+ * <p>Segments from before the header (format 1) hold records without {@code timestampNanos};
+ * {@link JournalReader} reads both.
  *
  * <p>{@code sourceId} names the buffer an event was read from, chosen by whoever wires the
  * journal. Several buffers carry copies of the same message (an order and its routed copy),
@@ -58,7 +63,12 @@ import org.agrona.concurrent.UnsafeBuffer;
  */
 public final class JournalWriter implements Closeable {
 
-    static final int HEADER_SIZE = Long.BYTES + Short.BYTES + Short.BYTES + Short.BYTES;
+    static final int HEADER_SIZE = Long.BYTES + Long.BYTES + Short.BYTES + Short.BYTES + Short.BYTES;
+    static final int SEGMENT_HEADER_SIZE = 16;
+    /** The first bytes of every segment, read as a little-endian int. */
+    static final int SEGMENT_MAGIC = 'G' | 'N' << 8 | 'J' << 16 | '2' << 24;
+    /** The record format this writer writes. */
+    public static final int FORMAT = 2;
     /** The source id of a gap record; no journaled buffer may use it. */
     public static final int GAP_SOURCE_ID = 0xFFFF;
     /** The template id of a gap record. */
@@ -76,6 +86,7 @@ public final class JournalWriter implements Closeable {
     private static final int REORDER_BUFFER_MASK = REORDER_BUFFER_CAPACITY - 1;
 
     private final long[] reorderSequences;
+    private final long[] reorderTimestamps;
     private final int[] reorderSourceIds;
     private final int[] reorderTemplateIds;
     private final int[] reorderLengths;
@@ -121,11 +132,13 @@ public final class JournalWriter implements Closeable {
     public JournalWriter(
             Path directory, long segmentSizeBytes, Consumer<JournalSegment> segmentListener, boolean skipsLost)
             throws IOException {
-        if (segmentSizeBytes < HEADER_SIZE + SequencedEvent.MAX_MESSAGE_SIZE || segmentSizeBytes > Integer.MAX_VALUE) {
+        if (segmentSizeBytes < SEGMENT_HEADER_SIZE + HEADER_SIZE + SequencedEvent.MAX_MESSAGE_SIZE
+                || segmentSizeBytes > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
                     "A segment must hold the largest record and fit one mapping: " + segmentSizeBytes + " bytes");
         }
         this.reorderSequences = new long[REORDER_BUFFER_CAPACITY];
+        this.reorderTimestamps = new long[REORDER_BUFFER_CAPACITY];
         this.reorderSourceIds = new int[REORDER_BUFFER_CAPACITY];
         this.reorderTemplateIds = new int[REORDER_BUFFER_CAPACITY];
         this.reorderLengths = new int[REORDER_BUFFER_CAPACITY];
@@ -154,15 +167,28 @@ public final class JournalWriter implements Closeable {
     }
 
     /**
-     * Returns a handler that appends every event it receives under {@code sourceId}, for passing
-     * to {@link SequencedRingBuffer#createPoller}. Allocates; call during wiring only.
+     * Polls {@code ring} into this journal under {@code sourceId}, with each event's publish time. Allocates; call
+     * during wiring, before the ring's producer first publishes.
      *
      * @param sourceId the id recorded with each event from this source
-     * @return a handler bound to this writer and source
+     * @return the poller the journaling agent polls
      */
-    public SequencedEventHandler source(int sourceId) {
-        return (globalSequence, templateId, buffer, length) ->
-                append(sourceId, globalSequence, templateId, buffer, length);
+    public SequencedPoller journal(SequencedRingBuffer<?> ring, int sourceId) {
+        final SequencedPoller[] poller = new SequencedPoller[1];
+        poller[0] = ring.createPoller((globalSequence, templateId, buffer, length) ->
+                append(sourceId, globalSequence, poller[0].timestampNanos(), templateId, buffer, length));
+        return poller[0];
+    }
+
+    /**
+     * As {@link #journal}, through a {@link LappingPoller}: for a journal that {@linkplain
+     * #JournalWriter(Path, long, Consumer, boolean) skips lost events} and must never hold the producer back.
+     */
+    public LappingPoller journalLapping(SequencedRingBuffer<?> ring, int sourceId) {
+        final LappingPoller[] poller = new LappingPoller[1];
+        poller[0] = ring.createLappingPoller((globalSequence, templateId, buffer, length) ->
+                append(sourceId, globalSequence, poller[0].timestampNanos(), templateId, buffer, length));
+        return poller[0];
     }
 
     /**
@@ -174,7 +200,8 @@ public final class JournalWriter implements Closeable {
      *     far ahead of the last written record to fit in the reorder buffer — which means some earlier global
      *     sequence number was taken by a buffer that is not journaled
      */
-    public void append(int sourceId, long globalSequence, int templateId, UnsafeBuffer buffer, int length) {
+    public void append(
+            int sourceId, long globalSequence, long timestampNanos, int templateId, UnsafeBuffer buffer, int length) {
         if (closed) {
             return;
         }
@@ -196,6 +223,7 @@ public final class JournalWriter implements Closeable {
         }
         int slot = (int) (globalSequence & REORDER_BUFFER_MASK);
         reorderSequences[slot] = globalSequence;
+        reorderTimestamps[slot] = timestampNanos;
         reorderSourceIds[slot] = sourceId;
         reorderTemplateIds[slot] = templateId;
         reorderLengths[slot] = length;
@@ -261,10 +289,11 @@ public final class JournalWriter implements Closeable {
             roll();
             mapped = mappedBuffer;
         }
-        if (mapped.position() == 0) {
+        if (mapped.position() == SEGMENT_HEADER_SIZE) {
             segmentFirstSequence = first;
         }
         mapped.putLong(first);
+        mapped.putLong(0);
         mapped.putShort((short) GAP_SOURCE_ID);
         mapped.putShort((short) GAP_TEMPLATE_ID);
         mapped.putShort((short) GAP_PAYLOAD_SIZE);
@@ -286,10 +315,11 @@ public final class JournalWriter implements Closeable {
                 roll();
                 mapped = mappedBuffer;
             }
-            if (mapped.position() == 0) {
+            if (mapped.position() == SEGMENT_HEADER_SIZE) {
                 segmentFirstSequence = nextSeq;
             }
             mapped.putLong(nextSeq);
+            mapped.putLong(reorderTimestamps[slot]);
             mapped.putShort((short) reorderSourceIds[slot]);
             mapped.putShort((short) reorderTemplateIds[slot]);
             mapped.putShort((short) length);
@@ -307,7 +337,7 @@ public final class JournalWriter implements Closeable {
      * @throws UncheckedIOException if the next segment cannot be created
      */
     public void roll() {
-        if (closed || mappedBuffer.position() == 0) {
+        if (closed || mappedBuffer.position() == SEGMENT_HEADER_SIZE) {
             return;
         }
         JournalSegment finished = finishSegment();
@@ -337,6 +367,9 @@ public final class JournalWriter implements Closeable {
             channel.truncate(segmentSizeBytes);
             MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_WRITE, 0, segmentSizeBytes);
             mapped.order(ByteOrder.LITTLE_ENDIAN);
+            mapped.putInt(SEGMENT_MAGIC);
+            mapped.putShort((short) FORMAT);
+            mapped.position(SEGMENT_HEADER_SIZE);
             this.mappedBuffer = mapped;
         }
         this.segmentPath = path;
@@ -362,7 +395,7 @@ public final class JournalWriter implements Closeable {
         return lateEvents;
     }
 
-    /** Returns the number of bytes written to the open segment so far. */
+    /** Returns the number of bytes written to the open segment so far, its header included. */
     public int segmentWrittenBytes() {
         return mappedBuffer.position();
     }
@@ -381,7 +414,7 @@ public final class JournalWriter implements Closeable {
             skipMissing();
         }
         closed = true;
-        if (mappedBuffer.position() == 0) {
+        if (mappedBuffer.position() == SEGMENT_HEADER_SIZE) {
             IoUtil.unmap(mappedBuffer);
             try {
                 Files.deleteIfExists(segmentPath);

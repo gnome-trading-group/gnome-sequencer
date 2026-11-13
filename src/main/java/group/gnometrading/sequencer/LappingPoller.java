@@ -28,6 +28,7 @@ public final class LappingPoller {
     private final UnsafeBuffer copy = ByteBufferUtils.createAlignedUnsafeBuffer(SequencedEvent.MAX_MESSAGE_SIZE);
     private long next;
     private long lapped;
+    private long timestampNanos;
 
     LappingPoller(final RingBuffer<SequencedEvent> ring, final ControlledSequencedEventHandler handler) {
         this.ring = ring;
@@ -81,6 +82,7 @@ public final class LappingPoller {
     private int read(final long sequence) throws Exception {
         final SequencedEvent event = ring.get(sequence);
         final long globalSequence = event.globalSequence;
+        final long publishedNanos = event.timestampNanos;
         final int templateId = event.templateId;
         final int length = event.bufferLength;
         if (length < 0 || length > SequencedEvent.MAX_MESSAGE_SIZE) {
@@ -93,7 +95,16 @@ public final class LappingPoller {
         if (ring.getCursor() - sequence >= size) {
             return LAPPED;
         }
+        timestampNanos = publishedNanos;
         return handler.onSequencedEvent(globalSequence, templateId, copy, length) ? READ : HELD;
+    }
+
+    /**
+     * When the event being handled was published ({@link SequencedEvent#timestampNanos}), read with the rest of the
+     * slot, for the handler to read during its callback.
+     */
+    public long timestampNanos() {
+        return timestampNanos;
     }
 
     /** Events skipped because the producer lapped this reader. */
