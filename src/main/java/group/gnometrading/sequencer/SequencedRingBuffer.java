@@ -6,6 +6,8 @@ import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.SleepingWaitStrategy;
 import group.gnometrading.schemas.SbeMessage;
 import group.gnometrading.utils.SampledEpochNanoClock;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.locks.LockSupport;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.EpochNanoClock;
@@ -36,6 +38,16 @@ import org.agrona.concurrent.UnsafeBuffer;
  */
 public final class SequencedRingBuffer<T extends SbeMessage> {
 
+    private static final VarHandle FULL_WAITS;
+
+    static {
+        try {
+            FULL_WAITS = MethodHandles.lookup().findVarHandle(SequencedRingBuffer.class, "fullWaits", long.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     public static final int DEFAULT_SIZE = 1 << 10;
 
     private final RingBuffer<SequencedEvent> ringBuffer;
@@ -48,6 +60,7 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
     // State for the currently claimed slot, held between claim() and publish().
     private SequencedEvent claimedEvent;
     private long claimedDisruptorSequence;
+    private long fullWaits;
 
     private volatile boolean stopped;
 
@@ -226,6 +239,29 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * stopped, ends in {@link RingBufferStoppedException}. A claim that finds room is unaffected. For the producer's
      * own shutdown; the ring isn't used after.
      */
+    /** Events published since the ring was made. Any thread. */
+    public long published() {
+        return this.ringBuffer.getCursor() + 1;
+    }
+
+    /**
+     * Events published that the slowest gating reader (a {@link #createPoller} reader; lapping readers never gate) has
+     * not yet taken: how far behind the ring's consumers are. Any thread.
+     */
+    public long backlog() {
+        return this.ringBuffer.getCursor() - this.ringBuffer.getMinimumGatingSequence();
+    }
+
+    /** How many events the ring holds. */
+    public int capacity() {
+        return this.ringBuffer.getBufferSize();
+    }
+
+    /** Publishes that found the ring full and waited for a reader: the producer held back. Any thread. */
+    public long fullWaits() {
+        return (long) FULL_WAITS.getAcquire(this);
+    }
+
     public void stop() {
         this.stopped = true;
     }
@@ -235,6 +271,11 @@ public final class SequencedRingBuffer<T extends SbeMessage> {
      * parks in a loop that ignores both interrupts and shutdown, so a producer on a consumer that stopped would hang.
      */
     private long nextSequence() {
+        if (!this.ringBuffer.hasAvailableCapacity(1)) {
+            // A count for readers on other threads, seen through the release store. With several producers two may
+            // count at once and one be lost: it's a measure, not a sequence.
+            FULL_WAITS.setRelease(this, this.fullWaits + 1);
+        }
         while (!this.ringBuffer.hasAvailableCapacity(1)) {
             if (this.stopped || Thread.currentThread().isInterrupted()) {
                 throw RingBufferStoppedException.INSTANCE;
